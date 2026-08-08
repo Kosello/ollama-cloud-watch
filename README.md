@@ -93,7 +93,7 @@ python ollama-cloud-watch.py --serve
 python ollama-cloud-watch.py --serve --port 8080
 ```
 
-Shows: session/weekly usage bars with color-coded thresholds, per-model breakdown (session + weekly), avg cost per request, weekly history table.
+Shows: session/weekly usage bars with color-coded thresholds, savings headline, per-model breakdown (session + weekly), avg cost per request (this week + lifetime), cache hit % per model, token volume, API equivalent cost, cost efficiency, break-even, monthly projection, weekly history, and all 5h session snapshots — every section collapsible (native `<details>`, zero JS).
 
 ### 2. Static HTML file (`--html`)
 
