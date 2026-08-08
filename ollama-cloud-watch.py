@@ -853,7 +853,7 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
         )
         tok_html = collapsible(
             "Token volume per model",
-            tok_rows + "<div class='cost'>Token volume = avg tokens/req × request count. Explains why GLM costs more than Flash.</div>",
+            tok_rows + "<div class='cost'>Total tokens processed per model this week (avg tokens per request × requests)</div>",
         )
     else:
         tok_html = ""
