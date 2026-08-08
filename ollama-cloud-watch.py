@@ -46,6 +46,10 @@ OPTIONS
   --crit PCT      Critical threshold (default 90)
   --report        Generate MD report from history, print path
   --open          Open the report in default app (use with --report)
+  --html          Generate standalone HTML dashboard file, print path
+  --serve         Start HTTP server with live dashboard at http://localhost:PORT
+  --api           Start HTTP server serving JSON REST endpoints only
+  --port PORT     HTTP server port (default 8642 for --serve, 8643 for --api)
   --cookie PATH   Custom cookie file path
   --json          Output raw JSON instead of formatted text
 """
@@ -518,7 +522,286 @@ def print_usage(data: dict, as_json: bool = False) -> None:
         print(f"     Avg: ${data.get('est_avg_cost_per_req', 0):.4f}/req across all models")
 
 
-# ── main ────────────────────────────────────────────────────────────────────
+# ── HTML dashboard ──────────────────────────────────────────────────────────
+
+def _pct_color(p):
+    if p is None:
+        return "var(--quaternary)"
+    if p >= 90:
+        return "#ef4444"
+    if p >= 75:
+        return "#f59e0b"
+    return "var(--secondary)"
+
+
+def _generate_html(data: dict, history: list, sessions: list) -> str:
+    """Self-contained HTML dashboard from current data + history."""
+    plan = data.get("plan") or "Unknown"
+    s = data.get("session_used_pct")
+    w = data.get("weekly_used_pct")
+    s_reset = data.get("session_reset") or "?"
+    w_reset = data.get("weekly_reset") or "?"
+    budget = data.get("est_weekly_budget", 0)
+    consumed = data.get("est_cost_consumed", 0)
+    avg_req = data.get("est_avg_cost_per_req", 0)
+
+    sm = data.get("session_models") or []
+    wm = data.get("weekly_models") or []
+
+    def model_rows(models, with_cost=False):
+        if not models:
+            return "<tr><td colspan='4' class='muted'>No data</td></tr>"
+        rows = []
+        for m in models:
+            reqs = m.get("requests", 0)
+            share = m.get("share_pct", 0) or 0
+            cr = m.get("est_cost_per_req", 0)
+            extra = f"<td class='num'>${cr:.4f}/req</td>" if with_cost else ""
+            rows.append(f"<tr><td>{m['model']}</td><td class='num'>{reqs}</td><td class='num'>{share:.1f}%</td>{extra}</tr>")
+        return "\n".join(rows)
+
+    def history_rows(weeks):
+        if not weeks:
+            return "<tr><td colspan='4' class='muted'>No history yet</td></tr>"
+        rows = []
+        for wk in weeks[-8:]:
+            w_pct = wk.get("weekly_used_pct", 0) or 0
+            cost = wk.get("est_cost_consumed")
+            models = wk.get("models") or []
+            top = max(models, key=lambda m: m.get("share_pct") or 0).get("model") if models else "-"
+            total = sum(m.get("requests") or 0 for m in models)
+            cost_s = f"${cost:.2f}" if cost is not None else "?"
+            rows.append(f"<tr><td>{wk.get('week')}</td><td class='num'>{w_pct:.1f}%</td><td class='num'>{cost_s}</td><td>{top} ({total})</td></tr>")
+        return "\n".join(rows)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ollama Cloud Usage Stats</title>
+<style>
+  :root {{
+    --bg: #0a0a0a; --card: #161616; --border: #2a2a2a;
+    --text: #e5e5e5; --secondary: #a1a1aa; --quaternary: #52525b;
+    --accent: #3b82f6; --green: #22c55e; --yellow: #f59e0b; --red: #ef4444;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif; padding: 20px; max-width: 800px; margin: 0 auto; }}
+  h1 {{ font-size: 1.4rem; margin-bottom: 4px; }}
+  .sub {{ color: var(--quaternary); font-size: 0.8rem; margin-bottom: 20px; }}
+  .cards {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 20px; }}
+  .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }}
+  .card h2 {{ font-size: 0.75rem; color: var(--secondary); margin-bottom: 8px; font-weight: 500; }}
+  .big {{ font-size: 1.8rem; font-weight: 700; }}
+  .reset {{ color: var(--quaternary); font-size: 0.8rem; margin-top: 4px; }}
+  .section {{ background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 12px; }}
+  .section h2 {{ font-size: 0.8rem; color: var(--secondary); margin-bottom: 10px; font-weight: 600; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th {{ text-align: left; font-size: 0.7rem; color: var(--quaternary); font-weight: 500; padding: 4px 8px; border-bottom: 1px solid var(--border); }}
+  td {{ padding: 6px 8px; border-bottom: 1px solid var(--border); font-size: 0.85rem; }}
+  .num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  .muted {{ color: var(--quaternary); text-align: center; padding: 12px; }}
+  .cost {{ color: var(--quaternary); font-size: 0.8rem; margin-top: 8px; }}
+  .bar {{ height: 6px; border-radius: 3px; background: var(--border); margin-top: 8px; overflow: hidden; }}
+  .bar-fill {{ height: 100%; border-radius: 3px; transition: width 0.5s; }}
+  footer {{ color: var(--quaternary); font-size: 0.7rem; text-align: center; margin-top: 20px; }}
+</style>
+</head>
+<body>
+  <h1>📊 Ollama Cloud Usage Stats</h1>
+  <div class="sub">{plan} plan · generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>
+
+  <div class="cards">
+    <div class="card">
+      <h2>Session</h2>
+      <div class="big" style="color: {_pct_color(s)}">{s:.1f}%</div>
+      <div class="reset">resets in {s_reset}</div>
+      <div class="bar"><div class="bar-fill" style="width:{s or 0}%;background:{_pct_color(s)}"></div></div>
+    </div>
+    <div class="card">
+      <h2>Weekly</h2>
+      <div class="big" style="color: {_pct_color(w)}">{w:.1f}%</div>
+      <div class="reset">resets in {w_reset}</div>
+      <div class="bar"><div class="bar-fill" style="width:{w or 0}%;background:{_pct_color(w)}"></div></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Session — per model</h2>
+    <table><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Share</th></tr></thead><tbody>{model_rows(sm)}</tbody></table>
+  </div>
+
+  <div class="section">
+    <h2>Weekly — per model</h2>
+    <table><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Share</th><th class="num">Cost</th></tr></thead><tbody>{model_rows(wm, with_cost=True)}</tbody></table>
+    <div class="cost">Budget: ${budget:.2f}/wk · consumed: ${consumed:.2f} · avg ${avg_req:.4f}/req</div>
+  </div>
+
+  <div class="section">
+    <h2>Weekly history</h2>
+    <table><thead><tr><th>Week</th><th class="num">Used</th><th class="num">Cost</th><th>Top model</th></tr></thead><tbody>{history_rows(history)}</tbody></table>
+  </div>
+
+  <footer>Ollama Cloud Usage Stats · <a href="https://github.com/Kosello/ollama-cloud-watch">github.com/Kosello/ollama-cloud-watch</a></footer>
+</body>
+</html>"""
+
+
+# ── HTTP server (serve + api) ───────────────────────────────────────────────
+
+def _build_api_data(cookie_path: Path) -> dict:
+    """Fetch fresh usage + load history + sessions for API/dashboard."""
+    data = _fetch_usage(cookie_path)
+    _record_history(data, HISTORY_FILE)
+    _record_session(data, SESSION_FILE)
+    history = _load_history(HISTORY_FILE)
+    sessions = _load_history(SESSION_FILE)  # reuse loader
+    return {"usage": data, "history": history[-52:], "sessions": sessions[-50:]}
+
+
+class _APIHandler:
+    """Minimal request handler supporting both --serve and --api modes."""
+
+    def __init__(self, cookie_path: Path, mode: str = "api"):
+        self.cookie_path = cookie_path
+        self.mode = mode
+        self._cache: dict = {"ts": 0, "data": None}
+        self._cache_ttl = 30  # 30s cache for HTTP requests
+
+    def _cached_data(self) -> dict:
+        now = time.time()
+        if self._cache["data"] and (now - self._cache["ts"]) < self._cache_ttl:
+            return self._cache["data"]
+        try:
+            data = _build_api_data(self.cookie_path)
+            self._cache["ts"] = now
+            self._cache["data"] = data
+            return data
+        except Exception as e:
+            return {"error": str(e)}
+
+    def handle(self, method: str, path: str) -> tuple[int, str, str]:
+        """Return (status_code, content_type, body)."""
+        if method != "GET":
+            return 405, "text/plain", "Method not allowed"
+
+        if self.mode == "serve" and path == "/":
+            d = self._cached_data()
+            html = _generate_html(d.get("usage", {}), d.get("history", []), d.get("sessions", []))
+            return 200, "text/html; charset=utf-8", html
+
+        if self.mode == "serve" and path == "/health":
+            return 200, "application/json", json.dumps({"ok": True})
+
+        # API endpoints (available in both modes)
+        if path == "/api/usage":
+            d = self._cached_data()
+            return 200, "application/json", json.dumps(d.get("usage", d), indent=2, default=str)
+        if path == "/api/history":
+            d = self._cached_data()
+            return 200, "application/json", json.dumps(d.get("history", []), indent=2, default=str)
+        if path == "/api/sessions":
+            d = self._cached_data()
+            return 200, "application/json", json.dumps(d.get("sessions", []), indent=2, default=str)
+        if path == "/api/lifetime":
+            d = self._cached_data()
+            weeks = d.get("history", [])
+            lt = _lifetime_from_history(weeks)
+            return 200, "application/json", json.dumps(lt, indent=2, default=str)
+        if path == "/health":
+            return 200, "application/json", json.dumps({"ok": True})
+
+        if self.mode == "serve":
+            return 404, "text/plain", "Not found"
+        return 404, "application/json", json.dumps({"error": "not found"})
+
+
+def _lifetime_from_history(weeks: list) -> dict:
+    """Aggregate lifetime stats from history records."""
+    if not weeks:
+        return {"ok": True, "weeks_count": 0, "models": []}
+    model_reqs: dict[str, int] = {}
+    model_cost_wsum: dict[str, float] = {}
+    for rec in weeks:
+        for m in rec.get("models") or []:
+            model = m.get("model")
+            reqs = m.get("requests") or 0
+            cpr = m.get("est_cost_per_req")
+            if not model or reqs <= 0:
+                continue
+            model_reqs[model] = model_reqs.get(model, 0) + reqs
+            if cpr is not None:
+                model_cost_wsum[model] = model_cost_wsum.get(model, 0.0) + cpr * reqs
+    total_reqs = sum(model_reqs.values())
+    total_cost = sum(model_cost_wsum.values())
+    weekly_budget = 20.0 / 4.33
+    models = []
+    for model in model_reqs:
+        reqs = model_reqs[model]
+        cpr = model_cost_wsum.get(model, 0.0) / reqs if reqs else 0.0
+        models.append({
+            "model": model, "requests": reqs,
+            "est_cost_per_req": round(cpr, 4),
+            "est_cost_per_req_pct": round(cpr / weekly_budget * 100.0, 4),
+            "est_cost": round(model_cost_wsum.get(model, 0.0), 4),
+        })
+    models.sort(key=lambda m: m.get("requests") or 0, reverse=True)
+    return {
+        "ok": True, "weeks_count": len(weeks),
+        "total_requests": total_reqs,
+        "est_total_cost": round(total_cost, 4),
+        "est_avg_cost_per_req": round(total_cost / total_reqs, 4) if total_reqs else 0.0,
+        "est_avg_cost_per_req_pct": round((total_cost / total_reqs) / weekly_budget * 100.0, 4) if total_reqs else 0.0,
+        "models": models,
+    }
+
+
+def _run_server(cookie_path: Path, mode: str, port: int) -> int:
+    """Start a stdlib HTTP server (no dependencies)."""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    handler_ctx = _APIHandler(cookie_path, mode)
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            status, ctype, body = handler_ctx.handle(self.command, self.path)
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
+
+        def log_message(self, fmt, *args):
+            pass  # quiet
+
+    label = "dashboard" if mode == "serve" else "API"
+    print(f"🚀 Ollama Cloud {label} server on http://localhost:{port}")
+    if mode == "serve":
+        print(f"   Dashboard: http://localhost:{port}/")
+    print(f"   Endpoints: /api/usage  /api/history  /api/sessions  /api/lifetime  /health")
+    print(f"   Ctrl+C to stop")
+    try:
+        server = HTTPServer(("127.0.0.1", port), Handler)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
+
+
+def _generate_html_file(cookie_path: Path) -> str:
+    """Generate a standalone HTML file from current data + history."""
+    data = _fetch_usage(cookie_path)
+    _record_history(data, HISTORY_FILE)
+    _record_session(data, SESSION_FILE)
+    history = _load_history(HISTORY_FILE)
+    sessions = _load_history(SESSION_FILE)
+    html_file = Path.home() / ".ollama-cloud-dashboard.html"
+    html_file.write_text(_generate_html(data, history, sessions))
+    return str(html_file)
+
+
+# ── main ────────────────────────────────────────────────────────────
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -534,6 +817,10 @@ def main() -> int:
     parser.add_argument("--crit", type=float, default=CRIT_PCT, help="Critical threshold %%")
     parser.add_argument("--report", action="store_true", help="Generate MD report from history")
     parser.add_argument("--open", action="store_true", help="Open report in default app")
+    parser.add_argument("--html", action="store_true", help="Generate standalone HTML dashboard file")
+    parser.add_argument("--serve", action="store_true", help="Start HTTP server with live dashboard")
+    parser.add_argument("--api", action="store_true", help="Start HTTP server with JSON API only")
+    parser.add_argument("--port", type=int, default=0, help="HTTP server port (default: 8642 serve, 8643 api)")
     parser.add_argument("--cookie", type=Path, default=DEFAULT_COOKIE_FILE, help="Cookie file path")
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
     args = parser.parse_args()
@@ -593,6 +880,33 @@ def main() -> int:
             except Exception as e:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Error: {e}", file=sys.stderr)
             time.sleep(args.interval)
+
+    # --html: generate standalone HTML file
+    if args.html:
+        try:
+            path = _generate_html_file(args.cookie)
+            if args.open:
+                try:
+                    subprocess.Popen(["open", path])
+                    print(f"Dashboard opened: {path}")
+                except (OSError, FileNotFoundError):
+                    print(path)
+            else:
+                print(path)
+            return 0
+        except Exception as e:
+            print(f"❌ Error: {e}", file=sys.stderr)
+            return 1
+
+    # --serve: live HTTP dashboard
+    if args.serve:
+        port = args.port or 8642
+        return _run_server(args.cookie, "serve", port)
+
+    # --api: JSON API server
+    if args.api:
+        port = args.port or 8643
+        return _run_server(args.cookie, "api", port)
 
     # Default: one-shot print
     try:

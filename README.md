@@ -79,6 +79,57 @@ python ollama-cloud-watch.py --report --open
 python ollama-cloud-watch.py --json
 ```
 
+## Dashboard (3 ways)
+
+### 1. Live web dashboard (`--serve`)
+
+Starts a local HTTP server with a self-contained dark-themed dashboard — no dependencies, just Python stdlib.
+
+```bash
+python ollama-cloud-watch.py --serve
+# → http://localhost:8642/
+
+# Custom port
+python ollama-cloud-watch.py --serve --port 8080
+```
+
+Shows: session/weekly usage bars with color-coded thresholds, per-model breakdown (session + weekly), avg cost per request, weekly history table.
+
+### 2. Static HTML file (`--html`)
+
+Generates a standalone `.html` file from current data — open it in any browser, share it, no server needed.
+
+```bash
+python ollama-cloud-watch.py --html          # prints path
+python ollama-cloud-watch.py --html --open   # opens in default app
+```
+
+### 3. JSON API server (`--api`)
+
+Serves REST endpoints only — for Grafana, custom dashboards, curl/jq, or your own frontend.
+
+```bash
+python ollama-cloud-watch.py --api
+# → http://localhost:8643/api/usage
+```
+
+Endpoints:
+
+| Endpoint | Returns |
+|---|---|
+| `/api/usage` | Current usage (session/weekly %, resets, per-model, cost estimates) |
+| `/api/history` | Weekly history snapshots (all recorded weeks) |
+| `/api/sessions` | 5h session snapshots |
+| `/api/lifetime` | Lifetime aggregated stats (all weeks, per-model avg cost) |
+| `/health` | `{"ok": true}` |
+
+```bash
+curl http://localhost:8643/api/usage | jq '.weekly_used_pct'
+curl http://localhost:8643/api/lifetime | jq '.est_avg_cost_per_req'
+```
+
+All endpoints return JSON with CORS headers (`Access-Control-Allow-Origin: *`), so you can fetch from any frontend.
+
 ## Cookie
 
 The script reads your Ollama Cloud session cookie from either:
