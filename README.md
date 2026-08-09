@@ -1,5 +1,11 @@
 # ollama-cloud-watch
 
+> **⚠️ WORK IN PROGRESS — expect bugs.** This tool is under active development.
+> The core scraper, watch mode, and reports work, but you may hit rough edges
+> (parser breakage when Ollama changes their HTML, cookie expiry, edge cases in
+> the dashboard). If something breaks, [open an issue](https://github.com/Kosello/ollama-cloud-watch/issues)
+> or just re-paste a fresh cookie.
+
 Standalone Ollama Cloud usage monitor — a single Python file, zero dependencies (stdlib only). Works on macOS, Linux, and Windows. No Hermes Agent needed.
 
 ![Ollama Cloud](https://img.shields.io/badge/ollama-cloud-000000?logo=ollama&logoColor=white)
