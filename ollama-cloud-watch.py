@@ -83,6 +83,15 @@ KEYCHAIN_ACCOUNT = "ollama"
 HISTORY_MAX_WEEKS = 52  # keep a full year
 SESSION_LOG_CAP = 1000
 
+# ── Price / token fallback chain (mirrors the Hermes plugin) ──────────────
+# Priority: manual override file → live OpenRouter (24h cache) → builtin.
+PRICE_OVERRIDE_FILE = Path.home() / ".ollama-cloud-prices.json"
+PRICE_CACHE_FILE = Path.home() / ".ollama-cloud-price-cache.json"
+PRICE_CACHE_TTL_SECONDS = 24 * 3600
+OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+_prices_cache: dict = {"ts": 0, "prices": None, "source": None}
+
 
 # ── cookie ──────────────────────────────────────────────────────────────────
 
@@ -160,6 +169,166 @@ def _relative_reset(iso_str: str) -> str:
         return f"{days} day" if days == 1 else f"{days} days"
     except (ValueError, TypeError):
         return iso_str
+
+
+# ── price / token fallback chain (mirrors the Hermes plugin) ────────────────
+
+def _load_manual_price_overrides() -> dict:
+    """Read manual price/token overrides from ~/.ollama-cloud-prices.json.
+
+    Format (all optional):
+    {
+      "models": {
+        "glm-5.2": {"input": 1.40, "output": 4.40, "cache_read": 0.26}
+      },
+      "tokens_per_request": {
+        "glm-5.2": [100000, 3000, 20000]   # [in, out, cache_read]
+      }
+    }
+    Returns {"prices": {...}, "tokens": {...}}.
+    """
+    result = {"prices": {}, "tokens": {}}
+    try:
+        if not PRICE_OVERRIDE_FILE.exists():
+            return result
+        data = json.loads(PRICE_OVERRIDE_FILE.read_text())
+        result["prices"] = data.get("models", {})
+        result["tokens"] = data.get("tokens_per_request", {})
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"warning: price override file unreadable: {e}", file=sys.stderr)
+    return result
+
+
+def _fetch_openrouter_prices() -> dict:
+    """Fetch official API list prices from OpenRouter's public model list.
+
+    Returns {model_id: (input_per_1M, output_per_1M, cache_read_per_1M)}.
+    Raises on network/parse failure so callers fall through the chain.
+    """
+    req = urllib.request.Request(
+        OPENROUTER_MODELS_URL,
+        headers={"User-Agent": "ollama-cloud-watch/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+    prices = {}
+    for m in payload.get("data", []):
+        pid = m.get("id", "")
+        pricing = m.get("pricing", {}) or {}
+        inp = pricing.get("prompt")
+        out = pricing.get("completion")
+        cache = pricing.get("input_cache_read") or pricing.get("cache_read")
+        try:
+            # OpenRouter reports per-token prices; our convention is USD per
+            # 1M tokens (matches the builtin table) — normalize here.
+            prices[pid] = (float(inp) * 1e6, float(out) * 1e6,
+                           float(cache) * 1e6 if cache is not None else None)
+        except (TypeError, ValueError):
+            continue
+    if not prices:
+        raise RuntimeError("OpenRouter model list returned no pricing")
+    return prices
+
+
+def _resolve_api_prices() -> tuple[dict, str]:
+    """Fallback chain for per-1M-token API prices.
+
+    1. manual override file (~/.ollama-cloud-prices.json)
+    2. live OpenRouter fetch (24h disk+memory cache)
+    3. builtin defaults (hardcoded table below)
+    Returns (prices_by_model, source_label).
+    """
+    # 1. Manual overrides win outright.
+    overrides = _load_manual_price_overrides()
+    if overrides["prices"]:
+        return overrides["prices"], "manual override file"
+
+    # 2. Live OpenRouter, cached 24h on disk + in memory.
+    now = time.time()
+    if _prices_cache["prices"] and (now - _prices_cache["ts"]) < PRICE_CACHE_TTL_SECONDS:
+        return _prices_cache["prices"], _prices_cache["source"]
+    if PRICE_CACHE_FILE.exists():
+        try:
+            cached = json.loads(PRICE_CACHE_FILE.read_text())
+            age = now - cached.get("fetched_at", 0)
+            if age < PRICE_CACHE_TTL_SECONDS and cached.get("prices"):
+                _prices_cache["ts"] = now
+                _prices_cache["prices"] = cached["prices"]
+                _prices_cache["source"] = "OpenRouter (cached)"
+                return cached["prices"], "OpenRouter (cached)"
+        except (json.JSONDecodeError, OSError):
+            pass
+    try:
+        live = _fetch_openrouter_prices()
+        _prices_cache["ts"] = now
+        _prices_cache["prices"] = live
+        _prices_cache["source"] = "OpenRouter (live)"
+        try:
+            PRICE_CACHE_FILE.write_text(json.dumps(
+                {"fetched_at": now, "prices": live}, indent=2))
+        except OSError:
+            pass
+        return live, "OpenRouter (live)"
+    except Exception as e:
+        print(f"warning: OpenRouter price fetch failed: {e}", file=sys.stderr)
+
+    # 3. Builtin defaults — never fail, but stale if vendors change prices.
+    return _BUILTIN_PRICES, "builtin defaults"
+
+
+_BUILTIN_PRICES = {
+    "glm-5.2": (1.40, 4.40, 0.26),
+    "glm-5.2:cloud": (1.40, 4.40, 0.26),
+    "glm-5": (1.40, 4.40, 0.26),
+    "deepseek-v4-flash:0731": (0.14, 0.28, 0.0028),
+    "deepseek-v4-flash": (0.14, 0.28, 0.0028),
+    "deepseek-v4-pro": (1.74, 3.48, 0.0036),
+    "minimax-m3": (0.24, 0.96, 0.06),
+    "gemma4:31b": (0.30, 0.90, 0.30),
+    "kimi-k2.7-code": (0.95, 4.00, 0.19),
+    "kimi-k2.6": (0.95, 4.00, 0.16),
+    "gpt-5.5": (1.25, 10.00, 1.25),
+}
+
+
+def _lookup_price(API_PRICES: dict, model: str) -> tuple | None:
+    """Resolve a dashboard model name to a price tuple.
+
+    Tries exact match first, then OpenRouter-style suffix match
+    (e.g. 'glm-5.2' matches 'z-ai/glm-5.2', ':0731' variants stripped).
+    """
+    if model in API_PRICES:
+        return API_PRICES[model]
+    base = model.split(":")[0]
+    if base in API_PRICES:
+        return API_PRICES[base]
+    for key, val in API_PRICES.items():
+        if key.endswith(f"/{model}") or key.endswith(f"/{base}"):
+            return val
+    return None
+
+
+def _resolve_token_averages(overrides: dict) -> tuple[dict, str]:
+    """Fallback chain for per-model avg tokens/request.
+
+    1. manual override tokens_per_request
+    2. Hermes state.db real averages (if Hermes is installed)
+    3. None → caller uses the 1000/500 assumption
+    Returns ({model: (in, out, cache)}, source_label).
+    """
+    if overrides["tokens"]:
+        clean = {}
+        for m, v in overrides["tokens"].items():
+            try:
+                clean[m] = (float(v[0]), float(v[1]), float(v[2]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if clean:
+            return clean, "manual override file"
+    from_db = _real_token_averages()
+    if from_db:
+        return from_db, "Hermes state.db"
+    return {}, "no token data"
 
 
 def _parse_usage(html: str) -> dict:
@@ -246,22 +415,16 @@ def _parse_usage(html: str) -> dict:
     result["est_avg_cost_per_req"] = round(cost_consumed / total_reqs, 4) if total_reqs else 0.0
 
     # ── API equivalent cost comparison (mirrors the Hermes plugin) ────────
-    # Official API list prices per 1M tokens (in/out/cache-hit), USD, Aug 2026.
-    API_PRICES = {
-        "glm-5.2": (1.40, 4.40, 0.26),
-        "glm-5.2:cloud": (1.40, 4.40, 0.26),
-        "glm-5": (1.40, 4.40, 0.26),
-        "deepseek-v4-flash:0731": (0.14, 0.28, 0.0028),
-        "deepseek-v4-flash": (0.14, 0.28, 0.0028),
-        "deepseek-v4-pro": (1.74, 3.48, 0.0036),
-        "minimax-m3": (0.24, 0.96, 0.06),
-        "gemma4:31b": (0.30, 0.90, 0.30),
-        "kimi-k2.7-code": (0.95, 4.00, 0.19),
-        "kimi-k2.6": (0.95, 4.00, 0.16),
-        "gpt-5.5": (1.25, 10.00, 1.25),
-    }
+    # Prices come from the fallback chain (manual override file → live
+    # OpenRouter, cached 24h → builtin defaults). Token counts per request
+    # come from Hermes' own state.db — real per-model averages
+    # (input/output/cache-read), falling back to the cross-model mean,
+    # then to the 1000/500 assumption. Cache-hit input is billed at the
+    # discounted rate by all four vendors.
+    API_PRICES, price_source = _resolve_api_prices()
 
-    token_avgs = _real_token_averages()
+    overrides = _load_manual_price_overrides()
+    token_avgs, token_source = _resolve_token_averages(overrides)
 
     fallback_avg = None
     if token_avgs:
@@ -274,7 +437,7 @@ def _parse_usage(html: str) -> dict:
 
     api_weekly_total = 0.0
     for seg in result["weekly_models"]:
-        prices = API_PRICES.get(seg["model"])
+        prices = _lookup_price(API_PRICES, seg["model"])
         if prices:
             p_in, p_out, p_cache = prices
             avg = token_avgs.get(seg["model"]) or fallback_avg
@@ -311,6 +474,8 @@ def _parse_usage(html: str) -> dict:
 
     result["api_weekly_total"] = round(api_weekly_total, 4)
     result["api_assumption"] = _api_assumption_text(token_avgs)
+    result["price_source"] = price_source
+    result["token_source"] = token_source
     result["api_total_pct"] = (
         round(cost_consumed / api_weekly_total * 100.0, 1) if api_weekly_total > 0 else None
     )

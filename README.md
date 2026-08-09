@@ -194,6 +194,32 @@ cost_per_req    = model_cost / requests
 
 The model share% comes from Ollama's own usage bar segments, which already reflect the GPU-time weighting — so heavier models show higher per-request cost.
 
+### "What would this cost on the native APIs?" — fallback chain
+
+The API-equivalent cost uses real token counts × official API list prices, resolved through a fallback chain — the first source that has data wins, manual is the last resort when everything else fails:
+
+| Level | Prices (per 1M tokens) | Tokens per request |
+|---|---|---|
+| 1 | **Manual override file** `~/.ollama-cloud-prices.json` | **Manual override** (same file, `tokens_per_request` key) |
+| 2 | **Live OpenRouter fetch** (vendor list prices, cached 24h) | **Hermes state.db** (real per-model averages, if Hermes is installed) |
+| 3 | Builtin defaults (bundled table) | Cross-model mean of known models |
+| 4 | — | 1000 in + 500 out assumption |
+
+The output shows which source was used (`price_source` / `token_source` in `--json`). To pin prices yourself, create `~/.ollama-cloud-prices.json`:
+
+```json
+{
+  "models": {
+    "glm-5.2": { "input": 1.40, "output": 4.40, "cache_read": 0.26 }
+  },
+  "tokens_per_request": {
+    "glm-5.2": [100000, 3000, 20000]
+  }
+}
+```
+
+Delete the file to revert to automatic. Cache-hit input tokens are billed at the discounted cache rate.
+
 ## Caveats
 
 - **Cookie scraping is brittle** — if Ollama changes their settings page markup or the cookie expires, re-extract the cookie.
