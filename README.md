@@ -1,10 +1,8 @@
 # ollama-cloud-watch
 
 > **⚠️ WORK IN PROGRESS — expect bugs.** This tool is under active development.
-> The core scraper, watch mode, and reports work, but you may hit rough edges
-> (parser breakage when Ollama changes their HTML, cookie expiry, edge cases in
-> the dashboard). If something breaks, [open an issue](https://github.com/Kosello/ollama-cloud-watch/issues)
-> or just re-paste a fresh cookie.
+> The API client, cookie fallback, watch mode, and reports work, but you may hit
+> rough edges. If something breaks, [open an issue](https://github.com/Kosello/ollama-cloud-watch/issues).
 
 Standalone Ollama Cloud usage monitor — a single Python file, zero dependencies (stdlib only). Works on macOS, Linux, and Windows. No Hermes Agent needed.
 
@@ -14,9 +12,11 @@ Standalone Ollama Cloud usage monitor — a single Python file, zero dependencie
 ![Python](https://img.shields.io/badge/python-3.9+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Ollama Cloud has **no usage API** — the only source is the web dashboard at [ollama.com/settings](https://ollama.com/settings). This script scrapes that page with your session cookie and gives you:
+The script uses Ollama's official `GET /api/usage` endpoint first and falls back
+to scraping [ollama.com/settings](https://ollama.com/settings) with a session cookie.
 
-- **Current usage** — session & weekly %, reset times, per-model request counts, estimated cost per request
+- **Current usage** — observed session/weekly quota %, per-model request counts,
+  effective subscription $/request, and estimated API-equivalent $/request + $/1M tokens
 - **Watch mode** — continuous polling with history recording and threshold alerts
 - **History** — weekly snapshots + 5h session snapshots saved locally (survives Ollama's resets)
 - **Alerts** — silent watchdog that fires OS notifications when usage crosses 75% / 90%
@@ -29,9 +29,8 @@ Ollama Cloud has **no usage API** — the only source is the web dashboard at [o
 curl -O https://raw.githubusercontent.com/Kosello/ollama-cloud-watch/main/ollama-cloud-watch.py
 chmod +x ollama-cloud-watch.py
 
-# Set up cookie (get it from ollama.com/settings → DevTools → Cookies → __Secure-session)
-echo '__Secure-session=<value>' > ~/.ollama-cloud-cookie.txt
-chmod 600 ~/.ollama-cloud-cookie.txt
+# Recommended: export the API key or put it in ~/.ollama-cloud-api-key.txt (mode 600)
+export OLLAMA_API_KEY='...'
 
 # Print current usage
 python ollama-cloud-watch.py
@@ -40,20 +39,18 @@ python ollama-cloud-watch.py
 Output:
 ```
 📊 Ollama Cloud — Pro plan
-   Session:  19.2% used · resets in 4h
-   Weekly:   48.7% used · resets in 1 day
-   Est. cost consumed: $2.25 / $4.62/wk
+   Session:  19.2% used · est. reset in 4h
+   Weekly:   48.7% used · est. reset in 1 day
+   Effective subscription: $0.0039/req ($4.60 7-day plan equivalent)
 
    Session per model:
-     glm-5.2                      34 req · 79.6%
-     deepseek-v4-flash:0731       81 req · 20.4%
+     glm-5.2                      34 req · 79.6% req share
+     deepseek-v4-flash:0731       81 req · 20.4% req share
 
    Weekly per model:
-     glm-5.2                     668 req · 89.6% · $0.0030/req
-     deepseek-v4-flash:0731      504 req · 7.5% · $0.0003/req
-     deepseek-v4-pro               2 req · 2.3% · $0.0258/req
-     minimax-m3                   12 req · 0.5% · $0.0009/req
-     Avg: $0.0019/req across all models
+     glm-5.2                     668 req · 56.2% req share · $0.0080/req · $0.078/1M
+     deepseek-v4-flash:0731      504 req · 42.4% req share · $0.0030/req · $0.092/1M
+     API price coverage: 100.00% of requests
 ```
 
 ## All modes
@@ -101,7 +98,9 @@ python ollama-cloud-watch.py --serve
 python ollama-cloud-watch.py --serve --port 8080
 ```
 
-Shows: session/weekly usage bars with color-coded thresholds, savings headline, per-model breakdown (session + weekly), avg cost per request (this week + lifetime), cache hit % per model, token volume, API equivalent cost, cost efficiency, break-even, monthly projection, weekly history, and all 5h session snapshots — every section collapsible (native `<details>`, zero JS).
+Shows: session/weekly usage bars with color-coded thresholds, per-model request
+mix, effective subscription cost, cache/token estimates, API-equivalent cost,
+break-even comparison, weekly history, and 5h session snapshots.
 
 ### 2. Static HTML file (`--html`)
 
@@ -183,36 +182,47 @@ All files are kept in your home directory, independent of any other tool:
 ~/.ollama-cloud-alert-state.json  # threshold state (prevents repeat alerts)
 ```
 
-## Cost estimate
+## Calculation model
 
-Ollama Cloud bills by GPU-time utilization, not tokens. The per-request cost is a rough proxy based on the dashboard's per-model usage share:
+Ollama quota percentage is **not money spent**. The subscription calculation is
+only a transparent allocation of the fixed plan fee:
 
+```text
+weeks_per_month                = 365.2425 / 12 / 7
+7_day_plan_equivalent          = monthly_plan_price / weeks_per_month
+effective_subscription_$/req   = 7_day_plan_equivalent / requests_in_quota_window
 ```
-weekly_budget   = plan_price / 4.33          # Pro $20/mo ≈ $4.62/wk
-cost_consumed   = weekly_budget × weekly_used%
-model_cost      = cost_consumed × model_share%
-cost_per_req    = model_cost / requests
+
+No per-model subscription cost is shown because the usage API exposes request
+share, not model quota weights.
+
+### API-equivalent estimate
+
+The API-equivalent estimate combines observed request counts with estimated
+tokens/request and public OpenRouter token prices:
+
+```text
+API_$/req = uncached_input × input_$/token
+          + cached_input   × cache_$/token
+          + output         × output_$/token
+effective_API_$/1M = API_$/req
+                    / (uncached_input + cached_input + output) × 1,000,000
 ```
 
-The model share% comes from Ollama's own usage bar segments, which already reflect the GPU-time weighting — so heavier models show higher per-request cost.
-
-### "What would this cost on the native APIs?" — fallback chain
-
-The API-equivalent cost uses real token counts × official API list prices, resolved through a fallback chain — the first source that has data wins, manual is the last resort when everything else fails:
+Prices and token averages use automatic sources with per-model manual overrides:
 
 | Level | Prices (per 1M tokens) | Tokens per request |
 |---|---|---|
-| 1 | **Manual override file** `~/.ollama-cloud-prices.json` | **Manual override** (same file, `tokens_per_request` key) |
-| 2 | **Live OpenRouter fetch** (vendor list prices, cached 24h) | **Hermes state.db** (real per-model averages, if Hermes is installed) |
-| 3 | Builtin defaults (bundled table) | Cross-model mean of known models |
-| 4 | — | 1000 in + 500 out assumption |
+| Automatic base | Live OpenRouter data (cached 24h), then builtin gaps | Hermes `state.db` request-weighted model/global averages |
+| Manual layer | `~/.ollama-cloud-prices.json` per-model fields | Same file, `tokens_per_request` per model |
+| Final fallback | Builtin table | 1000 input + 500 output |
 
 The output shows which source was used (`price_source` / `token_source` in `--json`). To pin prices yourself, create `~/.ollama-cloud-prices.json`:
 
 ```json
 {
   "models": {
-    "glm-5.2": { "input": 1.40, "output": 4.40, "cache_read": 0.26 }
+    "glm-5.2": { "input": 0.07, "output": 0.22, "cache_read": 0.013 }
   },
   "tokens_per_request": {
     "glm-5.2": [100000, 3000, 20000]
@@ -220,17 +230,22 @@ The output shows which source was used (`price_source` / `token_source` in `--js
 }
 ```
 
-Delete the file to revert to automatic. Cache-hit input tokens are billed at the discounted cache rate.
+Delete the file to revert to automatic. If no cache-read price is published,
+cached input uses the regular input price; it is never treated as free.
 
 ## Caveats
 
-- **Cookie scraping is brittle** — if Ollama changes their settings page markup or the cookie expires, re-extract the cookie.
+- The official API does not expose plan tier, reset timestamps, current token
+  counts, cache hits, elapsed weekly-period time, or per-model quota weights.
+  API reset times are shown as unavailable; token costs are labeled estimates.
+- Cookie scraping is fallback-only and remains brittle.
 - The cookie is a login token — keep it private (`chmod 600` on the file).
 - The script uses only Python stdlib — no pip install needed.
 
 ## Hermes Agent integration
 
-If you use [Hermes Agent](https://hermes-agent.nousresearch.com), there's a full desktop plugin (statusbar chip + pane with collapsible sections, per-model breakdown, API price comparison, lifetime stats) at [Kosello/ollama-cloud-usage-stats](https://github.com/Kosello/ollama-cloud-usage-stats).
+If you use [Hermes Agent](https://hermes-agent.nousresearch.com), the integrated
+desktop/backend plugin lives at [Kosello/ollama-usage-monitor](https://github.com/Kosello/ollama-usage-monitor).
 
 ## License
 

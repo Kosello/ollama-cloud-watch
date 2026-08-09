@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .DS_Store
 ollama_cookie.txt
+ollama_api_key.txt
+.ollama-cloud-cookie.txt
+.ollama-cloud-api-key.txt
