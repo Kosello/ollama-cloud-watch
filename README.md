@@ -1,7 +1,7 @@
 # ollama-cloud-watch
 
 > **⚠️ WORK IN PROGRESS — expect bugs.** This tool is under active development.
-> The API client, cookie fallback, watch mode, and reports work, but you may hit
+> The cookie scraper, API fallback, watch mode, and reports work, but you may hit
 > rough edges. If something breaks, [open an issue](https://github.com/Kosello/ollama-cloud-watch/issues).
 
 Standalone Ollama Cloud usage monitor — a single Python file, zero dependencies (stdlib only). Works on macOS, Linux, and Windows. No Hermes Agent needed.
@@ -12,11 +12,9 @@ Standalone Ollama Cloud usage monitor — a single Python file, zero dependencie
 ![Python](https://img.shields.io/badge/python-3.9+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-The script uses Ollama's official `GET /api/usage` endpoint first and falls back
-to scraping [ollama.com/settings](https://ollama.com/settings) with a session cookie.
+The script fetches the authenticated [settings page](https://ollama.com/settings) first because its per-model usage-bar shares are required for Ollama $/1M estimates. `GET /api/usage` is a fallback for aggregate percentages and request counts; it cannot provide per-model Ollama prices.
 
-- **Current usage** — observed session/weekly quota %, per-model request counts,
-  effective subscription $/request, and estimated API-equivalent $/request + $/1M tokens
+- **Current usage** — observed session/weekly quota %, per-model request counts and usage-bar shares, estimated Ollama $/1M, and API-equivalent $/request + $/1M
 - **Watch mode** — continuous polling with history recording and threshold alerts
 - **History** — weekly snapshots + 5h session snapshots saved locally (survives Ollama's resets)
 - **Alerts** — silent watchdog that fires OS notifications when usage crosses 75% / 90%
@@ -29,29 +27,37 @@ to scraping [ollama.com/settings](https://ollama.com/settings) with a session co
 curl -O https://raw.githubusercontent.com/Kosello/ollama-cloud-watch/main/ollama-cloud-watch.py
 chmod +x ollama-cloud-watch.py
 
-# Recommended: export the API key or put it in ~/.ollama-cloud-api-key.txt (mode 600)
+# Primary: save __Secure-session from ollama.com in a mode-600 cookie file
+echo '__Secure-session=<value>' > ~/.ollama-cloud-cookie.txt
+chmod 600 ~/.ollama-cloud-cookie.txt
+
+# Optional fallback: export the API key or use ~/.ollama-cloud-api-key.txt
 export OLLAMA_API_KEY='...'
 
 # Print current usage
 python ollama-cloud-watch.py
 ```
 
-Output:
-```
+Output (abridged):
+```text
 📊 Ollama Cloud — Pro plan
-   Session:  19.2% used · est. reset in 4h
-   Weekly:   48.7% used · est. reset in 1 day
-   Effective subscription: $0.0039/req ($4.60 7-day plan equivalent)
-
-   Session per model:
-     glm-5.2                      34 req · 79.6% req share
-     deepseek-v4-flash:0731       81 req · 20.4% req share
+   Session:  0.0% used · resets in 4h
+   Weekly:   99.2% used · resets in 4h
 
    Weekly per model:
-     glm-5.2                     668 req · 56.2% req share · $0.0080/req · $0.078/1M
-     deepseek-v4-flash:0731      504 req · 42.4% req share · $0.0030/req · $0.092/1M
-     API price coverage: 100.00% of requests
+     glm-5.2                   1428 req · 87.7% usage bar
+     deepseek-v4-flash:0731     929 req · 8.3% usage bar
+     deepseek-v4-pro            104 req · 3.6% usage bar
+
+   Plan vs API — per-model effective $/1M token comparison
+     Source: settings-page usage bars
+
+     glm-5.2                   Ollama $0.0205 · API $0.0975 · 21% of API
+     deepseek-v4-flash:0731    Ollama $0.0026 · API $0.0904 · 3% of API
+     deepseek-v4-pro           Ollama $0.0118 · API $0.2545 · 5% of API
 ```
+
+The Ollama estimate uses the real weekly usage-bar share plus historical tokens/request. API input/cache/output prices are resolved per model. `Ollama/API` is the Ollama estimate as a percentage of the real API estimate; lower means better subscription value.
 
 ## All modes
 
@@ -93,6 +99,11 @@ Starts a local HTTP server with a self-contained dark-themed dashboard — no de
 ```bash
 python ollama-cloud-watch.py --serve
 # → http://localhost:8642/
+
+# If Hermes API already owns IPv4 127.0.0.1:8642, bind the dashboard to
+# IPv6 loopback. http://localhost:8642/ will use it while the Hermes API
+# remains available at http://127.0.0.1:8642/v1.
+python ollama-cloud-watch.py --serve --host ::1 --port 8642
 
 # Custom port
 python ollama-cloud-watch.py --serve --port 8080
@@ -158,6 +169,10 @@ Set `OLLAMA_COOKIE_SOURCE=auto|keychain|file` (default: `auto` — Keychain if p
 
 Use `--cookie /custom/path.txt` for a custom cookie file location.
 
+## API fallback
+
+If the cookie is missing, expired, or the settings markup changes, the script tries `GET https://ollama.com/api/usage` using `OLLAMA_API_KEY`, `~/.ollama-cloud-api-key.txt`, or the Hermes API-key file. The fallback provides aggregate session/weekly percentages and per-model request counts. It does **not** expose per-model usage-bar shares, current-window token/cache counts, exact reset timestamps, or plan tier, so per-model Ollama $/1M and Ollama/API percentages are reported as unavailable.
+
 ## Cron setup
 
 ```bash
@@ -184,17 +199,14 @@ All files are kept in your home directory, independent of any other tool:
 
 ## Calculation model
 
-Ollama quota percentage is **not money spent**. The subscription calculation is
-only a transparent allocation of the fixed plan fee:
+The cookie-backed settings page exposes each model's share of Ollama's weekly usage bar. The tool combines that share with the fixed plan price, request count, and estimated tokens/request:
 
 ```text
-weeks_per_month                = 365.2425 / 12 / 7
-7_day_plan_equivalent          = monthly_plan_price / weeks_per_month
-effective_subscription_$/req   = 7_day_plan_equivalent / requests_in_quota_window
+allocated plan value = 7-day plan equivalent × normalized model usage-bar share
+Ollama $/1M          = allocated plan value / estimated model tokens × 1,000,000
 ```
 
-No per-model subscription cost is shown because the usage API exposes request
-share, not model quota weights.
+This is an effective plan-price estimate, not an Ollama token tariff. The full fixed 7-day plan equivalent is allocated across models by Ollama's observed usage-bar shares, normalized so rounded bars reconcile exactly to the plan fee; it is never scaled down by quota percentage. Token volume is estimated because Ollama exposes no current-window token/cache counts. If a bar is rounded to `0.0%`, or only `/api/usage` is available, the model's Ollama $/1M and Ollama/API percentage are shown as unavailable rather than guessed.
 
 ### API-equivalent estimate
 

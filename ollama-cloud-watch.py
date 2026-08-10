@@ -2,8 +2,9 @@
 """
 ollama-cloud-watch.py — Standalone Ollama Cloud usage monitor.
 
-Works with or without Hermes Agent. An Ollama API key is recommended; the
-settings-page cookie is only a fallback.
+Works with or without Hermes Agent. The authenticated settings page is the
+primary source because it exposes per-model usage-bar shares; the official
+usage API is a limited fallback.
 
 USAGE
   # Print current usage once and exit
@@ -50,6 +51,7 @@ OPTIONS
   --html          Generate standalone HTML dashboard file, print path
   --serve         Start HTTP server with live dashboard at http://localhost:PORT
   --api           Start HTTP server serving JSON REST endpoints only
+  --host HOST     HTTP bind host (default 127.0.0.1; use ::1 for IPv6 loopback)
   --port PORT     HTTP server port (default 8642 for --serve, 8643 for --api)
   --cookie PATH   Custom cookie file path
   --json          Output raw JSON instead of formatted text
@@ -213,18 +215,14 @@ def _api_to_usage(api_data: dict) -> dict:
 
     session_usage = float(session.get("usage", 0) or 0)
     weekly_usage = float(weekly.get("usage", 0) or 0)
-    # The activity period is not the limit reset period. No exact reset
-    # timestamps are exposed by the API, so leave them unknown.
-    session_reset_iso = weekly_reset_iso = None
-
     data = {
         "plan": _configured_plan(),
         "session_used_pct": round(session_usage * 100.0, 1),
         "weekly_used_pct": round(weekly_usage * 100.0, 1),
-        "session_reset": _relative_reset(session_reset_iso) if session_reset_iso else None,
-        "weekly_reset": _relative_reset(weekly_reset_iso) if weekly_reset_iso else None,
-        "session_reset_iso": session_reset_iso,
-        "weekly_reset_iso": weekly_reset_iso,
+        "session_reset": None,
+        "weekly_reset": None,
+        "session_reset_iso": None,
+        "weekly_reset_iso": None,
         "session_models": _models(session),
         "weekly_models": _models(weekly),
         "source": "api",
@@ -464,6 +462,8 @@ def _parse_usage(html: str) -> dict:
         "weekly_reset_iso": None,
         "session_models": [],
         "weekly_models": [],
+        "source": "cookie",
+        "share_basis": "ollama_usage_bar",
     }
 
     plan_match = re.search(
@@ -515,7 +515,7 @@ def _parse_usage(html: str) -> dict:
         else:
             result["session_models"].append(seg)
 
-    result["share_basis"] = "requests"
+    result["share_basis"] = "ollama_usage_bar"
     result["reset_estimated"] = False
     if not result.get("plan"):
         result["plan"] = _configured_plan()
@@ -578,19 +578,60 @@ def _enrich_with_costs(data: dict) -> None:
         fallback_basis = "cross-model mean"
 
     api_total_raw = 0.0
+    api_input_cost_raw = 0.0
+    api_cache_cost_raw = 0.0
+    api_output_cost_raw = 0.0
+    priced_uncached_input_tokens = 0.0
+    priced_cache_read_tokens = 0.0
+    priced_output_tokens = 0.0
     priced_requests = 0
     unpriced_models = []
     token_bases = set()
     manual_token_models = set(overrides.get("tokens", {}))
+
+    def _token_profile(model: str):
+        avg = token_avgs.get(model)
+        if avg and model in manual_token_models:
+            basis = "manual model override"
+        elif avg:
+            basis = "model history"
+        elif fallback_avg:
+            avg = fallback_avg
+            basis = fallback_basis
+        else:
+            avg = (1000.0, 500.0, 0.0)
+            basis = "fixed fallback"
+        return (
+            max(float(avg[0] or 0), 0.0),
+            max(float(avg[1] or 0), 0.0),
+            max(float(avg[2] or 0), 0.0),
+            basis,
+        )
+
     for seg in weekly_segs:
         reqs = max(int(seg.get("requests") or 0), 0)
+        in_t, out_t, cache_t, token_basis = _token_profile(seg["model"])
+        prompt_t = in_t + cache_t
+        token_bases.add(token_basis)
+        seg["token_estimate_basis"] = token_basis
+        seg["avg_uncached_input_tokens"] = round(in_t)
+        seg["avg_cache_tokens"] = round(cache_t)
+        seg["avg_prompt_tokens"] = round(prompt_t)
+        seg["avg_in_tokens"] = round(prompt_t)
+        seg["avg_out_tokens"] = round(out_t)
+        seg["cache_hit_pct"] = round(cache_t / prompt_t * 100.0, 1) if prompt_t > 0 else None
+        seg["total_uncached_input_tokens"] = round(in_t * reqs)
+        seg["total_cache_read_tokens"] = round(cache_t * reqs)
+        seg["total_prompt_tokens"] = round(prompt_t * reqs)
+        seg["total_in_tokens"] = round(prompt_t * reqs)
+        seg["total_out_tokens"] = round(out_t * reqs)
+
         prices = _lookup_price(api_prices, seg["model"])
         if not prices:
             unpriced_models.append(seg["model"])
             for field in (
                 "api_cost_per_req", "api_effective_per_1m", "api_weekly_cost",
-                "api_cost_pct", "cache_hit_pct", "total_in_tokens",
-                "total_out_tokens", "api_input_cost", "api_cache_cost",
+                "api_cost_pct", "api_input_cost", "api_cache_cost",
                 "api_output_cost", "api_input_per_1m", "api_output_per_1m",
                 "api_cache_per_1m",
             ):
@@ -603,23 +644,6 @@ def _enrich_with_costs(data: dict) -> None:
         # Missing cache pricing means no published discount, not free input.
         p_cache = p_in if p_cache_published is None else float(p_cache_published)
 
-        avg = token_avgs.get(seg["model"])
-        if avg and seg["model"] in manual_token_models:
-            token_basis = "manual model override"
-        elif avg:
-            token_basis = "model history"
-        elif fallback_avg:
-            avg = fallback_avg
-            token_basis = fallback_basis
-        else:
-            avg = (1000.0, 500.0, 0.0)
-            token_basis = "fixed fallback"
-        token_bases.add(token_basis)
-
-        in_t = max(float(avg[0] or 0), 0.0)  # canonical uncached input
-        out_t = max(float(avg[1] or 0), 0.0)
-        cache_t = max(float(avg[2] or 0), 0.0)  # canonical cache-read input
-        prompt_t = in_t + cache_t
         per_req = (
             (in_t / 1e6) * p_in
             + (cache_t / 1e6) * p_cache
@@ -629,8 +653,17 @@ def _enrich_with_costs(data: dict) -> None:
         effective_per_1m = (
             per_req * 1e6 / processed_per_req if processed_per_req > 0 else None
         )
-        model_window_cost = per_req * reqs
+        input_cost = (in_t / 1e6) * p_in * reqs
+        cache_cost = (cache_t / 1e6) * p_cache * reqs
+        output_cost = (out_t / 1e6) * p_out * reqs
+        model_window_cost = input_cost + cache_cost + output_cost
         api_total_raw += model_window_cost
+        api_input_cost_raw += input_cost
+        api_cache_cost_raw += cache_cost
+        api_output_cost_raw += output_cost
+        priced_uncached_input_tokens += in_t * reqs
+        priced_cache_read_tokens += cache_t * reqs
+        priced_output_tokens += out_t * reqs
         priced_requests += reqs
 
         seg["api_cost_per_req"] = round(per_req, 6)
@@ -641,21 +674,9 @@ def _enrich_with_costs(data: dict) -> None:
         seg["api_output_per_1m"] = round(p_out, 6)
         seg["api_cache_per_1m"] = round(p_cache, 6)
         seg["api_cache_price_published"] = p_cache_published is not None
-        seg["token_estimate_basis"] = token_basis
-        seg["avg_uncached_input_tokens"] = round(in_t)
-        seg["avg_cache_tokens"] = round(cache_t)
-        seg["avg_prompt_tokens"] = round(prompt_t)
-        seg["avg_in_tokens"] = round(prompt_t)  # compatibility: total prompt input
-        seg["avg_out_tokens"] = round(out_t)
-        seg["cache_hit_pct"] = round(cache_t / prompt_t * 100.0, 1) if prompt_t > 0 else None
-        seg["total_uncached_input_tokens"] = round(in_t * reqs)
-        seg["total_cache_read_tokens"] = round(cache_t * reqs)
-        seg["total_prompt_tokens"] = round(prompt_t * reqs)
-        seg["total_in_tokens"] = round(prompt_t * reqs)  # compatibility
-        seg["total_out_tokens"] = round(out_t * reqs)
-        seg["api_input_cost"] = round((in_t / 1e6) * p_in * reqs, 4)
-        seg["api_cache_cost"] = round((cache_t / 1e6) * p_cache * reqs, 4)
-        seg["api_output_cost"] = round((out_t / 1e6) * p_out * reqs, 4)
+        seg["api_input_cost"] = round(input_cost, 4)
+        seg["api_cache_cost"] = round(cache_cost, 4)
+        seg["api_output_cost"] = round(output_cost, 4)
 
     api_known_window_total = round(api_total_raw, 4) if priced_requests else None
     pricing_complete = bool(total_reqs) and priced_requests == total_reqs
@@ -666,6 +687,93 @@ def _enrich_with_costs(data: dict) -> None:
     data["api_price_coverage_pct"] = round(
         priced_requests / total_reqs * 100.0, 2
     ) if total_reqs else None
+
+    def _component_rate(cost: float, tokens: float) -> float | None:
+        return round(cost * 1e6 / tokens, 6) if tokens > 0 else None
+
+    priced_prompt_tokens = priced_uncached_input_tokens + priced_cache_read_tokens
+    priced_all_tokens = priced_prompt_tokens + priced_output_tokens
+    api_prompt_cost_raw = api_input_cost_raw + api_cache_cost_raw
+    api_blended_rates = {
+        "uncached_input": _component_rate(api_input_cost_raw, priced_uncached_input_tokens),
+        "cache": _component_rate(api_cache_cost_raw, priced_cache_read_tokens),
+        "prompt": _component_rate(api_prompt_cost_raw, priced_prompt_tokens),
+        "output": _component_rate(api_output_cost_raw, priced_output_tokens),
+        "all": _component_rate(api_total_raw, priced_all_tokens),
+    }
+    covered_plan_equivalent = (
+        weekly_equivalent * priced_requests / total_reqs if total_reqs else 0.0
+    )
+    allocation_factor = (
+        covered_plan_equivalent / api_total_raw if api_total_raw > 0 else None
+    )
+
+    data["estimated_priced_uncached_input_tokens"] = round(priced_uncached_input_tokens)
+    data["estimated_priced_cache_read_tokens"] = round(priced_cache_read_tokens)
+    data["estimated_priced_prompt_tokens"] = round(priced_prompt_tokens)
+    data["estimated_priced_output_tokens"] = round(priced_output_tokens)
+    data["estimated_priced_all_tokens"] = round(priced_all_tokens)
+    data["api_blended_uncached_input_per_1m"] = api_blended_rates["uncached_input"]
+    data["api_blended_cache_per_1m"] = api_blended_rates["cache"]
+    data["api_blended_prompt_per_1m"] = api_blended_rates["prompt"]
+    data["api_blended_output_per_1m"] = api_blended_rates["output"]
+    data["api_blended_effective_per_1m"] = api_blended_rates["all"]
+    data["plan_priced_request_equivalent"] = round(covered_plan_equivalent, 4)
+    data["plan_rate_allocation_factor"] = (
+        round(allocation_factor, 8) if allocation_factor is not None else None
+    )
+    for bucket, api_rate in api_blended_rates.items():
+        field = "plan_effective_all_per_1m" if bucket == "all" else f"plan_effective_{bucket}_per_1m"
+        data[field] = (
+            round(api_rate * allocation_factor, 6)
+            if api_rate is not None and allocation_factor is not None else None
+        )
+    data["plan_rate_allocation_basis"] = (
+        "7-day plan equivalent prorated to priced requests and allocated by API cost mix"
+    )
+    # Per-model Ollama effective $/1M. Cookie data includes each model's share
+    # of the weekly usage bar. API-only mode lacks those quota weights and must
+    # not fabricate per-model Ollama prices.
+    is_cookie = data.get("source") == "cookie"
+    positive_share_total = sum(
+        max(float(seg.get("share_pct") or 0), 0.0) for seg in weekly_segs
+    )
+
+    weekly_used_fraction = max(float(data.get("weekly_used_pct") or 0), 0.0) / 100.0
+
+    for seg in weekly_segs:
+        seg["plan_rate_basis"] = None
+        if is_cookie:
+            gpu_share = seg.get("share_pct")
+            reqs = max(int(seg.get("requests") or 0), 0)
+            if gpu_share is not None and gpu_share > 0 and reqs > 0 and positive_share_total > 0:
+                model_tokens = (
+                    seg.get("avg_uncached_input_tokens", 0)
+                    + seg.get("avg_cache_tokens", 0)
+                    + seg.get("avg_out_tokens", 0)
+                )
+                seg["plan_effective_per_1m"] = round(
+                    weekly_equivalent * weekly_used_fraction * (gpu_share / positive_share_total)
+                    / (model_tokens * reqs) * 1e6,
+                    9,
+                ) if model_tokens > 0 and reqs > 0 else None
+                seg["plan_rate_basis"] = "ollama_usage_bar+historical_tokens"
+            else:
+                seg["plan_effective_per_1m"] = None
+        else:
+            seg["plan_effective_per_1m"] = None
+        if seg.get("plan_effective_per_1m") is not None and seg.get("api_effective_per_1m"):
+            seg["plan_pct_of_api"] = round(
+                seg["plan_effective_per_1m"] / seg["api_effective_per_1m"] * 100, 1
+            )
+        else:
+            seg["plan_pct_of_api"] = None
+    data["plan_rate_allocation_basis"] = (
+        "7-day plan equivalent × observed weekly quota fraction × normalized usage-bar share, "
+        "divided by estimated model tokens"
+        if is_cookie else
+        "Unavailable in API-only mode: /api/usage has no per-model quota weights"
+    )
     data["api_unpriced_models"] = unpriced_models
     data["api_assumption"] = (
         "Token estimate basis: " + ", ".join(sorted(token_bases))
@@ -674,6 +782,50 @@ def _enrich_with_costs(data: dict) -> None:
     data["price_source"] = price_source
     data["token_source"] = token_source
     data["ollama_monthly"] = round(monthly_cost, 2)
+
+    # ── session-level API equivalent cost ──
+    session_segs = data.get("session_models") or []
+    session_api_total = 0.0
+    session_priced_requests = 0
+    session_unpriced = []
+    for seg in session_segs:
+        reqs = max(int(seg.get("requests") or 0), 0)
+        in_t, out_t, cache_t, _ = _token_profile(seg["model"])
+        prompt_t = in_t + cache_t
+        seg["avg_uncached_input_tokens"] = round(in_t)
+        seg["avg_cache_tokens"] = round(cache_t)
+        seg["avg_prompt_tokens"] = round(prompt_t)
+        seg["avg_in_tokens"] = round(prompt_t)
+        seg["avg_out_tokens"] = round(out_t)
+        seg["total_uncached_input_tokens"] = round(in_t * reqs)
+        seg["total_cache_read_tokens"] = round(cache_t * reqs)
+        seg["total_prompt_tokens"] = round(prompt_t * reqs)
+        seg["total_in_tokens"] = round(prompt_t * reqs)
+        seg["total_out_tokens"] = round(out_t * reqs)
+
+        prices = _lookup_price(api_prices, seg["model"])
+        if not prices:
+            session_unpriced.append(seg["model"])
+            seg["api_session_cost"] = None
+            continue
+        p_in, p_out, p_cache_published = prices
+        p_in = float(p_in)
+        p_out = float(p_out)
+        p_cache = p_in if p_cache_published is None else float(p_cache_published)
+        per_req = (in_t / 1e6) * p_in + (cache_t / 1e6) * p_cache + (out_t / 1e6) * p_out
+        model_session_cost = per_req * reqs
+        session_api_total += model_session_cost
+        session_priced_requests += reqs
+        seg["api_session_cost"] = round(model_session_cost, 4)
+
+    total_session_reqs = sum(max(int(s.get("requests") or 0), 0) for s in session_segs)
+    session_complete = bool(total_session_reqs) and session_priced_requests == total_session_reqs
+    data["api_session_known_total"] = round(session_api_total, 4) if session_priced_requests else None
+    data["api_session_total"] = data["api_session_known_total"] if session_complete else None
+    data["api_session_coverage_pct"] = round(
+        session_priced_requests / total_session_reqs * 100.0, 2
+    ) if total_session_reqs else None
+    data["api_session_unpriced"] = session_unpriced
 
     if api_window_total is not None and api_window_total > 0:
         savings = api_window_total - weekly_equivalent
@@ -772,22 +924,25 @@ def _real_global_token_average() -> tuple | None:
 
 
 def _fetch_usage(cookie_path: Path) -> dict:
-    # Primary: official API (no cookie, no expiry).
-    api_key = _api_key()
-    if api_key:
-        try:
-            api_data = _fetch_usage_api(api_key)
-            data = _api_to_usage(api_data)
-            data["ok"] = True
-            data["fetched_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            return data
-        except Exception as e:
-            print(f"⚠️  Official API failed ({e}), falling back to cookie scrape…")
+    # Primary: authenticated settings page (real per-model usage-bar shares).
+    try:
+        cookie = _load_cookie(cookie_path)
+        html = _fetch_settings(cookie)
+        data = _parse_usage(html)
+        if data.get("session_used_pct") is None or data.get("weekly_used_pct") is None:
+            raise ValueError("settings page did not contain usage limits")
+        data["ok"] = True
+        data["fetched_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        return data
+    except Exception as e:
+        print(f"⚠️  Cookie scrape failed ({e}), trying official API fallback…", file=sys.stderr)
 
-    # Fallback: cookie scrape.
-    cookie = _load_cookie(cookie_path)
-    html = _fetch_settings(cookie)
-    data = _parse_usage(html)
+    # Fallback: official API (request counts, but no model quota weights).
+    api_key = _api_key()
+    if not api_key:
+        raise RuntimeError("cookie scrape failed and no Ollama API key is configured")
+    api_data = _fetch_usage_api(api_key)
+    data = _api_to_usage(api_data)
     data["ok"] = True
     data["fetched_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return data
@@ -1049,18 +1204,33 @@ def print_usage(data: dict, as_json: bool = False) -> None:
     print(f"📊 Ollama Cloud — {plan} plan")
     print(f"   Session:  {s:.1f}% used · {session_reset_text}" if s is not None else "   Session:  n/a")
     print(f"   Weekly:   {w:.1f}% used · {weekly_reset_text}" if w is not None else "   Weekly:   n/a")
-    print(
-        f"   Effective subscription: ${data.get('effective_subscription_cost_per_req', 0):.4f}/req "
-        f"(${data.get('subscription_weekly_equivalent', 0):.2f} 7-day plan equivalent)"
-    )
+
+    # ── API equivalent cost summary ──
+    session_api = data.get("api_session_total") if data.get("api_session_total") is not None else data.get("api_session_known_total")
+    weekly_api = data.get("api_window_total") if data.get("api_window_total") is not None else data.get("api_known_window_total")
+    if session_api is not None or weekly_api is not None:
+        print()
+        if session_api is not None:
+            print(f"   💰 Session: ${session_api:.4f} API")
+            for m in (data.get("session_models") or []):
+                sc = m.get("api_session_cost")
+                if sc is not None:
+                    print(f"      {m['model']:<23} ${sc:.4f}")
+        if weekly_api is not None:
+            print(f"   💰 Weekly:  ${weekly_api:.4f} API")
+            for m in (data.get("weekly_models") or []):
+                wc = m.get("api_weekly_cost")
+                if wc is not None:
+                    print(f"      {m['model']:<23} ${wc:.4f}")
     print()
 
     sm = data.get("session_models") or []
     wm = data.get("weekly_models") or []
+    share_label = "usage bar" if data.get("share_basis") == "ollama_usage_bar" else "req share"
     if sm:
         print("   Session per model:")
         for model in sm:
-            print(f"     {model['model']:<25} {model['requests']:>5} req · {model.get('share_pct', 0):.1f}% req share")
+            print(f"     {model['model']:<25} {model['requests']:>5} req · {model.get('share_pct', 0):.1f}% {share_label}")
         print()
 
     if wm:
@@ -1075,12 +1245,61 @@ def print_usage(data: dict, as_json: bool = False) -> None:
                          f"· output ${model['api_output_per_1m']:.3f} /1M")
             else:
                 api_text, rates = "API price n/a", None
-            print(f"     {model['model']:<25} {model['requests']:>5} req · {model.get('share_pct', 0):.1f}% req share · {api_text}")
+            print(f"     {model['model']:<25} {model['requests']:>5} req · {model.get('share_pct', 0):.1f}% {share_label} · {api_text}")
             if rates:
                 print(f"       {rates}")
         print(f"     API price coverage: {data.get('api_price_coverage_pct', 0):.2f}% of requests")
         if any(m.get("api_cache_price_published") is False for m in wm):
             print("     * no cache discount published; normal input rate used")
+
+    api_total = data.get("api_window_total")
+    api_known_total = data.get("api_known_window_total")
+    comparison_total = api_total if api_total is not None else api_known_total
+    if comparison_total is not None:
+        priced = [m for m in wm if m.get("api_effective_per_1m") is not None]
+        print()
+        print("   Plan vs API — per-model effective $/1M token comparison")
+        print(f"     Source: {'settings-page usage bars' if data.get('source') == 'cookie' else 'API fallback (Ollama price unavailable)'}")
+        if priced:
+            print()
+            for m in priced:
+                plan_rate = f"${m['plan_effective_per_1m']:.4f}" if m.get("plan_effective_per_1m") is not None else "n/a"
+                pct = f"{m['plan_pct_of_api']:.0f}%" if m.get("plan_pct_of_api") is not None else "n/a"
+                in_p  = f"${m['api_input_per_1m']:.4f}" if m.get("api_input_per_1m") else "?"
+                cache_p = f"${m['api_cache_per_1m']:.4f}" if m.get("api_cache_per_1m") else "n/a"
+                cache_note = "" if m.get("api_cache_price_published") else "*"
+                out_p = f"${m['api_output_per_1m']:.4f}" if m.get("api_output_per_1m") else "?"
+                print(f"     {m['model']:<25} Ollama {plan_rate}  ·  API ${m['api_effective_per_1m']:.4f}  ·  {pct} of API")
+                print(f"       API rates:  in {in_p}  ·  cache {cache_p}{cache_note}  ·  out {out_p} /1M")
+        print(f"     Ollama $/1M uses fixed 7-day plan price, observed quota fraction, normalized usage-bar share, and estimated tokens.")
+        print(f"     * = cache discount not published; input rate shown.")
+
+    # ── API usage percentage: compact Ollama/API ratio ──
+    if data.get('source') == 'cookie':
+        pct_models = [m for m in wm if m.get('plan_pct_of_api') is not None]
+        if pct_models:
+            print()
+            print("   API usage percentage — how much of the API price you pay")
+            print(f"     Source: settings-page usage bars")
+            print()
+            for m in pct_models:
+                pct = m['plan_pct_of_api']
+                flag = " ✓ green" if pct < 20 else (" ⚠ yellow" if pct > 80 else "")
+                print(f"     {m['model']:<25} {pct:.0f}% of API{flag}")
+            print(f"     Lower = better subscription value. <20% green, >80% yellow.")
+
+    # ── Price comparison: raw $/1M without the percentage column ──
+    price_models = [m for m in wm if m.get('api_effective_per_1m') is not None]
+    if price_models:
+        print()
+        print("   Price comparison — effective $/1M tokens")
+        source_note = 'settings-page usage bars' if data.get('source') == 'cookie' else 'API fallback — per-model Ollama price unavailable'
+        print(f"     Source: {source_note}")
+        print()
+        for m in price_models:
+            ollama_p = f"${m['plan_effective_per_1m']:.4f}" if m.get('plan_effective_per_1m') is not None else 'n/a'
+            print(f"     {m['model']:<25} Ollama {ollama_p}/1M  ·  API ${m['api_effective_per_1m']:.4f}/1M")
+        print(f"     Ollama: subscription allocated by usage-bar share. API: pay-per-token estimate.")
 
 
 # ── HTML dashboard ──────────────────────────────────────────────────────────
@@ -1153,10 +1372,11 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
     lt = _lifetime_from_history(history)
 
     api_total = data.get("api_window_total")
-    savings = data.get("api_savings_vs_plan")
+    api_known_total = data.get("api_known_window_total")
+    api_comparison_total = api_total if api_total is not None else api_known_total
+    api_comparison_complete = api_total is not None
     api_monthly = data.get("api_monthly_proj")
     plan_monthly = data.get("subscription_monthly_cost", data.get("ollama_monthly", 20.0))
-    api_pct = data.get("api_total_pct")
     assumption = data.get("api_assumption") or ""
 
     def model_rows(models, with_cost=False, with_cache=False, with_tokens=False):
@@ -1221,15 +1441,22 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
 
     # ── subscription vs API headline ──
     savings_html = ""
-    if savings is not None and api_total is not None:
-        if savings >= 0:
-            headline = f"Plan equivalent is <b>${abs(savings):.2f}</b> below API estimate"
+    if api_comparison_total is not None:
+        difference = api_comparison_total - weekly_equiv
+        if api_comparison_complete and difference >= 0:
+            headline = f"Plan equivalent is <b>${difference:.2f}</b> below API estimate"
+        elif api_comparison_complete:
+            headline = f"API estimate is <b>${abs(difference):.2f}</b> below plan equivalent so far"
+        elif difference >= 0:
+            headline = f"Plan equivalent is at least <b>${difference:.2f}</b> below the known API subtotal"
         else:
-            headline = f"API estimate is <b>${abs(savings):.2f}</b> below plan equivalent so far"
+            headline = "API comparison is incomplete"
+        comparison_label = "API estimate" if api_comparison_complete else "Known API subtotal"
+        coverage_note = "" if api_comparison_complete else f" · {data.get('api_price_coverage_pct', 0):.2f}% price coverage"
         savings_html = (
             "<div class='savings'>"
             f"<div class='savings-big'>{headline}</div>"
-            f"<div class='savings-sub'>API est. ${api_total:.2f} current quota window · {plan} 7-day equivalent ${weekly_equiv:.2f}</div>"
+            f"<div class='savings-sub'>{comparison_label} ${api_comparison_total:.2f} · {plan} 7-day equivalent ${weekly_equiv:.2f}{coverage_note}</div>"
             "</div>"
         )
 
@@ -1250,28 +1477,14 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
     )
 
     # ── session / weekly per model ──
+    share_heading = "Usage-bar share" if data.get("share_basis") == "ollama_usage_bar" else "Request share"
     session_table = (
-        "<table><thead><tr><th>Model</th><th class='num'>Requests</th><th class='num'>Request share</th></tr></thead>"
+        f"<table><thead><tr><th>Model</th><th class='num'>Requests</th><th class='num'>{share_heading}</th></tr></thead>"
         f"<tbody>{model_rows(sm)}</tbody></table>"
     )
     weekly_table = (
-        "<table><thead><tr><th>Model</th><th class='num'>Requests</th><th class='num'>Request share</th></tr></thead>"
+        f"<table><thead><tr><th>Model</th><th class='num'>Requests</th><th class='num'>{share_heading}</th></tr></thead>"
         f"<tbody>{model_rows(wm)}</tbody></table>"
-    )
-
-    # ── effective subscription cost ──
-    cost_week_html = collapsible(
-        "Effective subscription cost",
-        f"<div class='limit-row'><span>Across all requests</span><span class='num'>${effective_sub_cpr:.4f}/req</span></div>"
-        f"<div class='limit-row'><span>{plan} 7-day equivalent</span><span class='num'>${weekly_equiv:.2f} ÷ {data.get('total_weekly_requests', 0)} req</span></div>"
-        "<div class='cost'>Fixed plan allocation only. Ollama does not expose per-model quota cost.</div>",
-    )
-
-    # ── effective subscription cost over history ──
-    cost_lifetime_html = collapsible(
-        "Effective subscription cost (history)",
-        f"<div class='limit-row'><span>Across recorded requests</span><span class='num'>${lt.get('effective_subscription_cost_per_req',0):.4f}/req</span></div>"
-        f"<div class='cost'>{lt.get('weeks_count',0)} windows · {lt.get('total_requests',0)} requests · ${lt.get('subscription_total_equivalent',0):.2f} plan equivalent</div>",
     )
 
     # ── cache hit % ──
@@ -1315,50 +1528,121 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
         )
         coverage = data.get("api_price_coverage_pct")
         unpriced = data.get("api_unpriced_models") or []
-        incomplete = (f"<div class='cost'>Unpriced: {', '.join(unpriced)}. Totals/comparisons hidden until coverage is complete.</div>" if unpriced else "")
+        incomplete = (f"<div class='cost'>Unpriced: {', '.join(unpriced)}. The known subtotal is a lower bound; missing prices can only increase it.</div>" if unpriced else "")
         cache_note = ("<div class='cost'>* no cache discount published; normal input rate used</div>"
                       if any(m.get("api_cache_price_published") is False for m in api_known) else "")
+        # API cost totals
+        session_total = data.get("api_session_total") if data.get("api_session_total") is not None else data.get("api_session_known_total")
+        weekly_total = data.get("api_window_total") if data.get("api_window_total") is not None else data.get("api_known_window_total")
+        totals_html = ""
+        if session_total is not None or weekly_total is not None:
+            parts = []
+            if session_total is not None:
+                parts.append(f"Session: <b>${session_total:.4f}</b>")
+                for m in (data.get("session_models") or []):
+                    sc = m.get("api_session_cost")
+                    if sc is not None:
+                        parts.append(f"<span class='dim'>  {m['model']} — ${sc:.4f}</span>")
+            if weekly_total is not None:
+                parts.append(f"Weekly:  <b>${weekly_total:.4f}</b>")
+                for m in (data.get("weekly_models") or []):
+                    wc = m.get("api_weekly_cost")
+                    if wc is not None:
+                        parts.append(f"<span class='dim'>  {m['model']} — ${wc:.4f}</span>")
+            totals_html = "<div class='savings'>" + "<br>".join(parts) + "</div>"
+
         api_html = collapsible(
             "API equivalent cost",
-            "<div class='cost'>Estimated pay-per-token cost. Effective $/1M uses uncached input + cache-read input + output.</div>"
-            + api_rows
-            + f"<div class='cost'>Coverage: {coverage:.2f}% of requests · {assumption}</div>"
-            + cache_note
-            + incomplete,
+            totals_html
+            + "<div class='cost'>Estimated API cost of tokens already consumed on Ollama Cloud this window.</div>",
         )
     else:
         api_html = ""
 
-    # ── overall plan vs API ──
-    if api_pct is not None:
+    # ── Ollama vs API: per-model $/1M comparison ──
+    if api_comparison_total is not None:
+        priced = [m for m in (data.get("weekly_models") or [])
+                  if m.get("api_effective_per_1m") is not None]
+        model_cards = ""
+        for m in priced:
+            in_p  = f"${m['api_input_per_1m']:.4f}" if m.get("api_input_per_1m") else "?"
+            cache_p = f"${m['api_cache_per_1m']:.4f}" if m.get("api_cache_per_1m") else "n/a"
+            cache_note = "" if m.get("api_cache_price_published") else "*"
+            out_p = f"${m['api_output_per_1m']:.4f}" if m.get("api_output_per_1m") else "?"
+            ollama_p = f"${m['plan_effective_per_1m']:.4f}" if m.get("plan_effective_per_1m") is not None else "n/a"
+            ratio = f"{m['plan_pct_of_api']:.0f}%" if m.get("plan_pct_of_api") is not None else "n/a"
+            model_cards += (
+                f"<tr><td><b>{m['model']}</b></td>"
+                f"<td class='num'>{ollama_p}</td>"
+                f"<td class='num'>${m['api_effective_per_1m']:.4f}</td>"
+                f"<td class='num'>{ratio}</td></tr>"
+                f"<tr class='dim'><td>&nbsp;&nbsp;API input / cache / output</td>"
+                f"<td colspan='3' class='num'>{in_p} / {cache_p}{cache_note} / {out_p} /1M</td></tr>"
+            )
+        source_note = (
+            "Settings-page usage bars (cookie)"
+            if data.get("source") == "cookie" else
+            "API fallback — per-model Ollama prices unavailable"
+        )
+        rate_table = (
+            f"<div class='cost'><b>{source_note}</b></div>"
+            + (
+                "<table><thead><tr><th>Model</th><th class='num'>Ollama $/1M</th><th class='num'>API $/1M</th><th class='num'>Ollama/API</th></tr></thead>"
+                f"<tbody>{model_cards}</tbody></table>"
+                if model_cards else ""
+            )
+            + "<div class='cost'>Ollama $/1M uses fixed 7-day plan price, observed quota fraction, normalized usage-bar share, and estimated model tokens. "
+            "API component prices are real published rates. * = cache discount not published; input rate shown.</div>"
+        )
         eff_html = collapsible(
             "Plan vs API",
-            f"<div class='limit-row total-row'><span>{plan} 7-day equivalent</span>"
-            f"<span class='num'>{api_pct:.0f}% of API estimate</span></div>"
-            "<div class='cost'>Overall comparison only. Per-model Ollama quota consumption is not exposed.</div>",
+            rate_table,
+            open_=True,
         )
+
+        # ── API usage percentage compact HTML ──
+        pct_html = ""
+        if data.get("source") == "cookie":
+            pct_rows = ""
+            for m in priced:
+                pct_val = m.get("plan_pct_of_api")
+                if pct_val is None:
+                    continue
+                color = "#22c55e" if pct_val < 20 else ("#f59e0b" if pct_val > 80 else "var(--secondary)")
+                pct_rows += (
+                    f"<div class='limit-row'><span>{m['model']}</span>"
+                    f"<span class='num' style='color:{color}'><b>{pct_val:.0f}%</b> of API</span></div>"
+                )
+            if pct_rows:
+                pct_html = collapsible(
+                    "API usage percentage",
+                    f"<div class='cost'>How much of the API pay-per-token price you effectively pay via the subscription</div>"
+                    + pct_rows
+                    + "<div class='cost'>Lower = better subscription value. <20% green, >80% yellow.</div>",
+                )
+
+        # ── Price comparison compact HTML ──
+        price_html = ""
+        if priced:
+            price_rows = ""
+            for m in priced:
+                ollama_p = f"${m['plan_effective_per_1m']:.4f}" if m.get("plan_effective_per_1m") is not None else "n/a"
+                price_rows += (
+                    f"<div class='limit-row'><span>{m['model']}</span>"
+                    f"<span class='num'>Ollama {ollama_p} · API ${m['api_effective_per_1m']:.4f}</span></div>"
+                    f"<div class='cost'>/1M tokens estimated</div>"
+                )
+            price_note = "Effective $/1M — subscription allocation vs pay-per-token API" if data.get("source") == "cookie" else "API fallback — per-model Ollama price unavailable"
+            price_html = collapsible(
+                "Price comparison",
+                f"<div class='cost'>{price_note}</div>"
+                + price_rows
+                + "<div class='cost'>Ollama: subscription allocated by usage-bar share. API: pay-per-token estimate.</div>",
+            )
     else:
         eff_html = ""
-
-    # ── break-even ──
-    multiple = data.get("break_even_usage_multiple")
-    if api_total is not None and multiple is not None:
-        api_ratio = data.get("api_vs_plan_ratio")
-        relation = (
-            f"API estimate is {api_ratio:.2f}× the plan equivalent at current usage."
-            if api_ratio is not None and api_ratio >= 1
-            else "API is currently cheaper; more usage is needed to reach break-even."
-        )
-        label = "Break-even was at" if multiple < 1 else "Break-even at"
-        break_html = collapsible(
-            "Break-even usage",
-            f"<div class='limit-row'><span>API est. · current quota window</span><span class='num'>${api_total:.2f}</span></div>"
-            f"<div class='limit-row'><span>{plan} · 7-day equivalent</span><span class='num'>${weekly_equiv:.2f}</span></div>"
-            f"<div class='limit-row'><span>{label}</span><span class='num'>{multiple:.2f}× current usage</span></div>"
-            f"<div class='cost'>{relation}</div>",
-        )
-    else:
-        break_html = ""
+        pct_html = ""
+        price_html = ""
 
     # ── monthly projection ──
     if api_monthly is not None:
@@ -1455,13 +1739,12 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
   {collapsible("Session — per model", session_table, open_=True)}
   {collapsible("Weekly — per model", weekly_table, open_=True)}
 
-  {cost_week_html}
-  {cost_lifetime_html}
   {cache_html}
   {tok_html}
   {api_html}
   {eff_html}
-  {break_html}
+  {pct_html}
+  {price_html}
   {monthly_html}
   {history_html}
   {sessions_html}
@@ -1540,9 +1823,10 @@ class _APIHandler:
         return 404, "application/json", json.dumps({"error": "not found"})
 
 
-def _run_server(cookie_path: Path, mode: str, port: int) -> int:
+def _run_server(cookie_path: Path, mode: str, port: int, host: str = "127.0.0.1") -> int:
     """Start a stdlib HTTP server (no dependencies)."""
     from http.server import HTTPServer, BaseHTTPRequestHandler
+    import socket
 
     handler_ctx = _APIHandler(cookie_path, mode)
 
@@ -1558,18 +1842,22 @@ def _run_server(cookie_path: Path, mode: str, port: int) -> int:
         def log_message(self, fmt, *args):
             pass  # quiet
 
+    class LocalHTTPServer(HTTPServer):
+        address_family = socket.AF_INET6 if ":" in host else socket.AF_INET
+
     label = "dashboard" if mode == "serve" else "API"
-    print(f"🚀 Ollama Cloud {label} server on http://localhost:{port}")
+    display_host = "localhost" if host in {"127.0.0.1", "::1", "localhost"} else host
+    print(f"🚀 Ollama Cloud {label} server on http://{display_host}:{port}")
     if mode == "serve":
         print(f"   Dashboard: http://localhost:{port}/")
     print(f"   Endpoints: /api/usage  /api/history  /api/sessions  /api/lifetime  /health")
     print(f"   Ctrl+C to stop")
     try:
-        server = HTTPServer(("127.0.0.1", port), Handler)
+        server = LocalHTTPServer((host, port), Handler)
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nStopped.")
-        return 0
+    return 0
 
 
 def _generate_html_file(cookie_path: Path) -> str:
@@ -1603,6 +1891,7 @@ def main() -> int:
     parser.add_argument("--html", action="store_true", help="Generate standalone HTML dashboard file")
     parser.add_argument("--serve", action="store_true", help="Start HTTP server with live dashboard")
     parser.add_argument("--api", action="store_true", help="Start HTTP server with JSON API only")
+    parser.add_argument("--host", default="127.0.0.1", help="HTTP bind host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=0, help="HTTP server port (default: 8642 serve, 8643 api)")
     parser.add_argument("--cookie", type=Path, default=DEFAULT_COOKIE_FILE, help="Cookie file path")
     parser.add_argument("--json", action="store_true", help="Output raw JSON")
@@ -1684,12 +1973,12 @@ def main() -> int:
     # --serve: live HTTP dashboard
     if args.serve:
         port = args.port or 8642
-        return _run_server(args.cookie, "serve", port)
+        return _run_server(args.cookie, "serve", port, args.host)
 
     # --api: JSON API server
     if args.api:
         port = args.port or 8643
-        return _run_server(args.cookie, "api", port)
+        return _run_server(args.cookie, "api", port, args.host)
 
     # Default: one-shot print
     try:
