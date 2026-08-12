@@ -644,6 +644,11 @@ def _enrich_with_costs(data: dict) -> None:
         # Missing cache pricing means no published discount, not free input.
         p_cache = p_in if p_cache_published is None else float(p_cache_published)
 
+        # Real provider cache rate (state.db, non-Ollama providers; largest
+        # sample wins, OpenRouter last). Used for the cache-aware cost line.
+        real_cache = _cache_rate_for(seg["model"], _real_provider_cache_hits())
+        seg["api_real_cache_pct"] = real_cache
+
         per_req = (
             (in_t / 1e6) * p_in
             + (cache_t / 1e6) * p_cache
@@ -677,6 +682,22 @@ def _enrich_with_costs(data: dict) -> None:
         seg["api_input_cost"] = round(input_cost, 4)
         seg["api_cache_cost"] = round(cache_cost, 4)
         seg["api_output_cost"] = round(output_cost, 4)
+
+        # Cache-aware second line: same requests priced with the real provider
+        # cache hit rate applied to the prompt tokens.
+        if real_cache is not None and prompt_t > 0:
+            uncached_t = prompt_t * (1.0 - real_cache / 100.0)
+            cached_t = prompt_t * (real_cache / 100.0)
+            per_req_cached = (
+                (uncached_t / 1e6) * p_in
+                + (cached_t / 1e6) * p_cache
+                + (out_t / 1e6) * p_out
+            )
+            seg["api_cost_per_req_cached"] = round(per_req_cached, 6)
+            seg["api_weekly_cost_cached"] = round(per_req_cached * reqs, 4)
+        else:
+            seg["api_cost_per_req_cached"] = None
+            seg["api_weekly_cost_cached"] = None
 
     api_known_window_total = round(api_total_raw, 4) if priced_requests else None
     pricing_complete = bool(total_reqs) and priced_requests == total_reqs
@@ -768,6 +789,37 @@ def _enrich_with_costs(data: dict) -> None:
             )
         else:
             seg["plan_pct_of_api"] = None
+        # Cache break-even: the cache hit rate at which the pay-per-token API
+        # cost equals this model's subscription allocation. Always reported as
+        # a percentage — above 100% means even a 100% cache hit cannot make
+        # the API cheaper (plan always wins); 0% means the API wins even with
+        # no caching.
+        seg["api_break_even_cache_pct"] = None
+        seg["api_real_cache_pct"] = None
+        if seg.get("plan_effective_per_1m") is not None and seg.get("api_input_per_1m") is not None:
+            p_in = float(seg["api_input_per_1m"])
+            p_cache = float(seg["api_cache_per_1m"])
+            p_out = float(seg["api_output_per_1m"])
+            in_t = float(seg.get("avg_uncached_input_tokens") or 0)
+            cache_t = float(seg.get("avg_cache_tokens") or 0)
+            out_t = float(seg.get("avg_out_tokens") or 0)
+            prompt_t = in_t + cache_t
+            tokens_per_req = prompt_t + out_t
+            sub_per_req = seg["plan_effective_per_1m"] * tokens_per_req / 1e6
+            if sub_per_req > 0 and prompt_t > 0:
+                api_at_0 = (prompt_t * p_in + out_t * p_out) / 1e6
+                if p_cache >= p_in:
+                    # Caching does not reduce the API cost; the break-even is
+                    # either 0% (API cheaper even uncached) or 100%+ (plan wins).
+                    seg["api_break_even_cache_pct"] = 0.0 if sub_per_req >= api_at_0 else 100.0
+                else:
+                    denom = prompt_t * (p_cache - p_in)
+                    h = (sub_per_req * 1e6 - prompt_t * p_in - out_t * p_out) / denom
+                    seg["api_break_even_cache_pct"] = round(max(h, 0.0) * 100.0, 1)
+                # Real provider cache rate (state.db, non-Ollama providers).
+                seg["api_real_cache_pct"] = _cache_rate_for(
+                    seg["model"], _real_provider_cache_hits()
+                )
     data["plan_rate_allocation_basis"] = (
         "7-day plan equivalent × observed weekly quota fraction × normalized usage-bar share, "
         "divided by estimated model tokens"
@@ -817,6 +869,21 @@ def _enrich_with_costs(data: dict) -> None:
         session_api_total += model_session_cost
         session_priced_requests += reqs
         seg["api_session_cost"] = round(model_session_cost, 4)
+
+        # Cache-aware second line for the session window.
+        real_cache = _cache_rate_for(seg["model"], _real_provider_cache_hits())
+        seg["api_real_cache_pct"] = real_cache
+        if real_cache is not None and prompt_t > 0:
+            uncached_t = prompt_t * (1.0 - real_cache / 100.0)
+            cached_t = prompt_t * (real_cache / 100.0)
+            per_req_cached = (
+                (uncached_t / 1e6) * p_in
+                + (cached_t / 1e6) * p_cache
+                + (out_t / 1e6) * p_out
+            )
+            seg["api_session_cost_cached"] = round(per_req_cached * reqs, 4)
+        else:
+            seg["api_session_cost_cached"] = None
 
     total_session_reqs = sum(max(int(s.get("requests") or 0), 0) for s in session_segs)
     session_complete = bool(total_session_reqs) and session_priced_requests == total_session_reqs
@@ -921,6 +988,97 @@ def _real_global_token_average() -> tuple | None:
     except (sqlite3.Error, OSError):
         return None
 
+
+def _real_provider_cache_hits() -> dict:
+    """Real per-model cache hit rates from Hermes usage accounting.
+
+    Rows for any billing provider (deepseek, openrouter, …) record actual
+    native-API usage outside Ollama Cloud. Cache hit rate is
+    cache_read / (uncached_input + cache_read) per model — the same canonical
+    bucket semantics used everywhere else. Model names are stored with their
+    provider prefix (e.g. ``minimax/minimax-m3``, ``deepseek-v4-pro``).
+    When the same model was used via several providers, the rate from the
+    provider with the most recorded calls wins (largest sample).
+    """
+    state_db = STATE_DB
+    if not state_db.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True, timeout=5)
+        try:
+            for table in ("session_model_usage", "sessions"):
+                try:
+                    rows = conn.execute(
+                        f"""
+                        SELECT billing_provider,
+                               model,
+                               SUM(api_call_count),
+                               SUM(input_tokens),
+                               SUM(cache_read_tokens)
+                        FROM {table}
+                        WHERE billing_provider != 'ollama-cloud'
+                          AND api_call_count > 0
+                          AND (input_tokens > 0 OR cache_read_tokens > 0 OR output_tokens > 0)
+                        GROUP BY billing_provider, model
+                        """,
+                    ).fetchall()
+                    if rows or table == "sessions":
+                        best: dict[str, tuple[int, float]] = {}
+                        for _provider, model, calls, inp, cache in rows:
+                            inp = float(inp or 0)
+                            cache = float(cache or 0)
+                            if inp + cache > 0:
+                                rate = round(cache / (inp + cache) * 100.0, 1)
+                                if model not in best or calls > best[model][0]:
+                                    best[model] = (calls, rate)
+                        return {m: r for m, (_c, r) in best.items()}
+                except sqlite3.Error:
+                    if table == "sessions":
+                        raise
+            return {}
+        finally:
+            conn.close()
+    except (sqlite3.Error, OSError):
+        return {}
+
+
+def _cache_rate_for(model: str, hits: dict) -> float | None:
+    """Match an Ollama model name to a real provider cache rate.
+
+    Uses the same 4-step matching as ``_lookup_price``: exact key, ``:``→``-``
+    suffix match, normalized match (strip separators + common tags), then base
+    name without the variant. Provider prefixes (``minimax/minimax-m3``) are
+    handled by the suffix/normalized steps.
+    """
+    if not hits:
+        return None
+    if model in hits:
+        return hits[model]
+    hyphen_model = model.replace(":", "-")
+    for key, val in hits.items():
+        if key.endswith(f"/{hyphen_model}"):
+            return val
+
+    def _norm(s: str) -> str:
+        s = s.lower().replace("-", "").replace(":", "").replace(".", "")
+        s = s.replace("_", "")
+        for tag in ("it", "instruct", "free", "latest"):
+            if s.endswith(tag):
+                s = s[: -len(tag)]
+        return s
+
+    norm_model = _norm(hyphen_model)
+    for key, val in hits.items():
+        key_base = key.rsplit("/", 1)[-1] if "/" in key else key
+        if _norm(key_base) == norm_model:
+            return val
+    base = model.split(":", 1)[0]
+    if base in hits:
+        return hits[base]
+    for key, val in hits.items():
+        if key.endswith(f"/{base}"):
+            return val
+    return None
 
 
 def _fetch_usage(cookie_path: Path) -> dict:
@@ -1215,13 +1373,23 @@ def print_usage(data: dict, as_json: bool = False) -> None:
             for m in (data.get("session_models") or []):
                 sc = m.get("api_session_cost")
                 if sc is not None:
-                    print(f"      {m['model']:<23} ${sc:.4f}")
+                    line = f"      {m['model']:<23} ${sc:.4f}"
+                    scc = m.get("api_session_cost_cached")
+                    if scc is not None:
+                        rc = m.get("api_real_cache_pct")
+                        line += f"  (with cache {rc:.0f}%: ${scc:.4f})" if rc is not None else f"  (with cache: ${scc:.4f})"
+                    print(line)
         if weekly_api is not None:
             print(f"   💰 Weekly:  ${weekly_api:.4f} API")
             for m in (data.get("weekly_models") or []):
                 wc = m.get("api_weekly_cost")
                 if wc is not None:
-                    print(f"      {m['model']:<23} ${wc:.4f}")
+                    line = f"      {m['model']:<23} ${wc:.4f}"
+                    wcc = m.get("api_weekly_cost_cached")
+                    if wcc is not None:
+                        rc = m.get("api_real_cache_pct")
+                        line += f"  (with cache {rc:.0f}%: ${wcc:.4f})" if rc is not None else f"  (with cache: ${wcc:.4f})"
+                    print(line)
     print()
 
     sm = data.get("session_models") or []
@@ -1273,6 +1441,56 @@ def print_usage(data: dict, as_json: bool = False) -> None:
                 print(f"       API rates:  in {in_p}  ·  cache {cache_p}{cache_note}  ·  out {out_p} /1M")
         print(f"     Ollama $/1M uses fixed 7-day plan price, observed quota fraction, normalized usage-bar share, and estimated tokens.")
         print(f"     * = cache discount not published; input rate shown.")
+
+    # ── Cache break-even: at what cache hit rate does the API get cheaper? ──
+    be_models = [m for m in wm if m.get("api_break_even_cache_pct") is not None]
+    if be_models:
+        print()
+        print("   Cache break-even — when the API becomes cheaper than the subscription")
+        print()
+        for m in be_models:
+            be = m.get("api_break_even_cache_pct")
+            cur = m.get("cache_hit_pct")
+            real_rate = m.get("api_real_cache_pct")
+            if be > 100:
+                line = f">100% (plan always cheaper)"
+            elif be <= 0:
+                line = f"0% (API always cheaper)"
+            else:
+                line = f"API cheaper above {be:.0f}% cache hit"
+                if cur is not None:
+                    line += f" · you: {cur:.0f}%"
+            if real_rate is not None:
+                line += f" · real API: {real_rate:.0f}%"
+            print(f"     {m['model']:<25} {line}")
+        print(f"     Above the break-even the API is cheaper for that model; below it, the subscription wins.")
+
+    # ── Lifetime break-even & price comparison (aggregated saved weeks) ──
+    lt_be = _lifetime_break_even(_load_history(HISTORY_FILE))
+    if lt_be.get("models"):
+        print()
+        print("   Lifetime break-even & price comparison")
+        print(f"     Aggregated over {lt_be.get('weeks_count', 0)} saved week(s) · {lt_be.get('total_requests', 0)} requests · ${lt_be.get('subscription_total_equivalent', 0):.2f} plan equivalent")
+        print()
+        for m in lt_be["models"]:
+            if m.get("api_break_even_cache_pct") is None and m.get("api_effective_per_1m") is None:
+                continue
+            be = m.get("api_break_even_cache_pct")
+            real_rate = m.get("api_real_cache_pct")
+            if be is None:
+                be_line = "n/a"
+            elif be > 100:
+                be_line = ">100% (plan always cheaper)"
+            elif be <= 0:
+                be_line = "0% (API always cheaper)"
+            else:
+                be_line = f"API cheaper above {be:.0f}% cache hit"
+            if real_rate is not None:
+                be_line += f" · real API: {real_rate:.0f}%"
+            api_line = f"${m['api_effective_per_1m']:.4f}/1M" if m.get("api_effective_per_1m") is not None else "API n/a"
+            print(f"     {m['model']:<25} {m.get('requests', 0):>5} req · API {api_line} · {be_line}")
+        print(f"     Prices: {lt_be.get('price_source') or 'builtin'} · Tokens: {lt_be.get('token_source') or 'unknown'}")
+        print("     Break-even = cache hit rate at which the API would have been cheaper over the recorded period.")
 
     # ── API usage percentage: compact Ollama/API ratio ──
     if data.get('source') == 'cookie':
@@ -1356,6 +1574,135 @@ def _lifetime_from_history(weeks: list) -> dict:
     }
 
 
+def _lifetime_break_even(weeks: list) -> dict:
+    """Aggregate cache break-even + plan/API economics across all saved weeks.
+
+    Mirrors the Hermes backend ``_lifetime_break_even`` so both surfaces agree.
+    Each saved weekly record carries per-model request counts and usage-bar
+    shares; we aggregate those, attach current resolved API prices and token
+    profiles, and reuse the same break-even math as the live view.
+    """
+    if not weeks:
+        return {"ok": True, "weeks_count": 0, "models": []}
+    model_agg: dict[str, dict] = {}
+    total_plan_equivalent = 0.0
+    for record in weeks:
+        weekly = record.get("subscription_weekly_equivalent")
+        if weekly is None:
+            weekly = record.get("est_weekly_budget")
+        if weekly is None:
+            weekly = record.get("est_cost_consumed") or 0.0
+        weekly = float(weekly or 0.0)
+        total_plan_equivalent += weekly
+        week_rows = [r for r in (record.get("models") or []) if int(r.get("requests") or 0) > 0]
+        if not week_rows:
+            continue
+        # Same normalization as the live view: positive usage-bar shares only.
+        share_total = sum(
+            max(float(r.get("share_pct") or 0.0), 0.0) for r in week_rows
+        )
+        weekly_used_fraction = max(float(record.get("weekly_used_pct") or 0.0), 0.0) / 100.0
+        for row in week_rows:
+            model = row.get("model")
+            reqs = int(row.get("requests") or 0)
+            share = float(row.get("share_pct") or 0.0)
+            if not model or reqs <= 0:
+                continue
+            agg = model_agg.setdefault(model, {"requests": 0, "allocated": 0.0, "share_weighted": 0.0})
+            agg["requests"] += reqs
+            agg["share_weighted"] += share * reqs
+            if share > 0 and share_total > 0 and weekly_used_fraction > 0:
+                agg["allocated"] += (
+                    weekly * weekly_used_fraction * (share / share_total)
+                )
+
+    api_prices, price_source = _resolve_api_prices()
+    overrides = _load_manual_price_overrides()
+    token_avgs, token_source = _resolve_token_averages(overrides)
+    fallback_avg = _real_global_token_average()
+    fallback_basis = "request-weighted all-model history" if fallback_avg else None
+    if fallback_avg is None and token_avgs:
+        vals = list(token_avgs.values())
+        fallback_avg = (
+            round(sum(v[0] for v in vals) / len(vals)),
+            round(sum(v[1] for v in vals) / len(vals)),
+            round(sum(v[2] for v in vals) / len(vals)),
+        )
+        fallback_basis = "cross-model mean"
+
+    total_reqs = sum(a["requests"] for a in model_agg.values())
+    models = []
+    for model, agg in sorted(model_agg.items(), key=lambda kv: kv[1]["requests"], reverse=True):
+        entry: dict = {
+            "model": model,
+            "requests": agg["requests"],
+            "share_pct": round(agg["share_weighted"] / agg["requests"], 1) if agg["requests"] else None,
+        }
+        avg = token_avgs.get(model)
+        if avg:
+            basis = "model history"
+        elif fallback_avg:
+            avg = fallback_avg
+            basis = fallback_basis
+        else:
+            avg = (1000.0, 500.0, 0.0)
+            basis = "fixed fallback"
+        entry["token_estimate_basis"] = basis
+        in_t = max(float(avg[0] or 0), 0.0)
+        out_t = max(float(avg[1] or 0), 0.0)
+        cache_t = max(float(avg[2] or 0), 0.0)
+        prompt_t = in_t + cache_t
+        tokens_per_req = prompt_t + out_t
+        entry["avg_uncached_input_tokens"] = round(in_t)
+        entry["avg_cache_tokens"] = round(cache_t)
+        entry["avg_out_tokens"] = round(out_t)
+        entry["total_estimated_tokens"] = round(tokens_per_req * agg["requests"])
+        entry["api_effective_per_1m"] = None
+        entry["api_break_even_cache_pct"] = None
+        entry["api_real_cache_pct"] = None
+
+        prices = _lookup_price(api_prices, model)
+        if prices and tokens_per_req > 0:
+            p_in, p_out, p_cache_published = prices
+            p_in = float(p_in)
+            p_out = float(p_out)
+            p_cache = p_in if p_cache_published is None else float(p_cache_published)
+            per_req = (in_t / 1e6) * p_in + (cache_t / 1e6) * p_cache + (out_t / 1e6) * p_out
+            entry["api_effective_per_1m"] = round(per_req * 1e6 / tokens_per_req, 6)
+            entry["api_input_per_1m"] = round(p_in, 6)
+            entry["api_cache_per_1m"] = round(p_cache, 6)
+            entry["api_output_per_1m"] = round(p_out, 6)
+            entry["api_cache_price_published"] = p_cache_published is not None
+
+            # Per-model subscription allocation: the model's own share of the
+            # weekly plan fee across the recorded weeks, per request. This is
+            # the same math as the live view — never a blended average.
+            sub_per_req = (agg["allocated"] / agg["requests"]) if agg["requests"] else 0.0
+            if sub_per_req > 0 and prompt_t > 0:
+                api_at_0 = (prompt_t * p_in + out_t * p_out) / 1e6
+                if p_cache >= p_in:
+                    entry["api_break_even_cache_pct"] = 0.0 if sub_per_req >= api_at_0 else 100.0
+                else:
+                    denom = prompt_t * (p_cache - p_in)
+                    h = (sub_per_req * 1e6 - prompt_t * p_in - out_t * p_out) / denom
+                    entry["api_break_even_cache_pct"] = round(max(h, 0.0) * 100.0, 1)
+                # Real provider cache rate (state.db, non-Ollama providers).
+                entry["api_real_cache_pct"] = _cache_rate_for(
+                    model, _real_provider_cache_hits()
+                )
+        models.append(entry)
+
+    return {
+        "ok": True,
+        "weeks_count": len(weeks),
+        "total_requests": total_reqs,
+        "subscription_total_equivalent": round(total_plan_equivalent, 4),
+        "price_source": price_source,
+        "token_source": token_source,
+        "models": models,
+    }
+
+
 def _generate_html(data: dict, history: list, sessions: list) -> str:
     """Self-contained HTML dashboard — mirrors the Hermes pane (all sections,
     collapsible via native <details>/<summary> — zero JS required)."""
@@ -1370,6 +1717,7 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
     sm = data.get("session_models") or []
     wm = data.get("weekly_models") or []
     lt = _lifetime_from_history(history)
+    lt_be = _lifetime_break_even(history)
 
     api_total = data.get("api_window_total")
     api_known_total = data.get("api_known_window_total")
@@ -1542,13 +1890,23 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
                 for m in (data.get("session_models") or []):
                     sc = m.get("api_session_cost")
                     if sc is not None:
-                        parts.append(f"<span class='dim'>  {m['model']} — ${sc:.4f}</span>")
+                        line = f"<span class='dim'>  {m['model']} — ${sc:.4f}</span>"
+                        scc = m.get("api_session_cost_cached")
+                        if scc is not None:
+                            rc = m.get("api_real_cache_pct")
+                            line = line[:-7] + f" · with cache {rc:.0f}%: ${scc:.4f}</span>" if rc is not None else line[:-7] + f" · with cache: ${scc:.4f}</span>"
+                        parts.append(line)
             if weekly_total is not None:
                 parts.append(f"Weekly:  <b>${weekly_total:.4f}</b>")
                 for m in (data.get("weekly_models") or []):
                     wc = m.get("api_weekly_cost")
                     if wc is not None:
-                        parts.append(f"<span class='dim'>  {m['model']} — ${wc:.4f}</span>")
+                        line = f"<span class='dim'>  {m['model']} — ${wc:.4f}</span>"
+                        wcc = m.get("api_weekly_cost_cached")
+                        if wcc is not None:
+                            rc = m.get("api_real_cache_pct")
+                            line = line[:-7] + f" · with cache {rc:.0f}%: ${wcc:.4f}</span>" if rc is not None else line[:-7] + f" · with cache: ${wcc:.4f}</span>"
+                        parts.append(line)
             totals_html = "<div class='savings'>" + "<br>".join(parts) + "</div>"
 
         api_html = collapsible(
@@ -1600,6 +1958,31 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
             open_=True,
         )
 
+        # ── Cache break-even compact HTML ──
+        be_html = ""
+        be_models = [m for m in (data.get("weekly_models") or [])
+                     if m.get("api_break_even_cache_pct") is not None]
+        if be_models:
+            be_rows = ""
+            for m in be_models:
+                be = m.get("api_break_even_cache_pct")
+                cur = m.get("cache_hit_pct")
+                if be > 100:
+                    line = "&gt;100% (plan always cheaper)"
+                elif be <= 0:
+                    line = "0% (API always cheaper)"
+                else:
+                    line = f"API cheaper above {be:.0f}% cache hit"
+                    if cur is not None:
+                        line += f" · you: {cur:.0f}%"
+                be_rows += f"<div class='limit-row'><span>{m['model']}</span><span class='num'>{line}</span></div>"
+            be_html = collapsible(
+                "Cache break-even",
+                "<div class='cost'>Cache hit rate at which the pay-per-token API becomes cheaper than the subscription, per model</div>"
+                + be_rows
+                + "<div class='cost'>Above the break-even the API is cheaper for that model; below it, the subscription wins.</div>",
+            )
+
         # ── API usage percentage compact HTML ──
         pct_html = ""
         if data.get("source") == "cookie":
@@ -1641,6 +2024,7 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
             )
     else:
         eff_html = ""
+        be_html = ""
         pct_html = ""
         price_html = ""
 
@@ -1669,6 +2053,37 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
 
     # ── sessions ──
     sessions_html = collapsible("All 5h sessions", session_blocks(sessions))
+
+    # ── lifetime break-even & price comparison ──
+    ltbe_html = ""
+    if lt_be.get("models"):
+        ltbe_rows = ""
+        for m in lt_be["models"]:
+            if m.get("api_break_even_cache_pct") is None and m.get("api_effective_per_1m") is None:
+                continue
+            be = m.get("api_break_even_cache_pct")
+            real_rate = m.get("api_real_cache_pct")
+            if be is None:
+                be_line = "n/a"
+            elif be > 100:
+                be_line = "&gt;100% (plan always cheaper)"
+            elif be <= 0:
+                be_line = "0% (API always cheaper)"
+            else:
+                be_line = f"API cheaper above {be:.0f}% cache hit"
+            if real_rate is not None:
+                be_line += f" · real API: {real_rate:.0f}%"
+            api_line = f"${m['api_effective_per_1m']:.4f}/1M" if m.get("api_effective_per_1m") is not None else "API n/a"
+            ltbe_rows += (
+                f"<div class='limit-row'><span>{m['model']} · {m.get('requests', 0)} req</span>"
+                f"<span class='num'>API {api_line} · {be_line}</span></div>"
+            )
+        ltbe_html = collapsible(
+            "Lifetime break-even & price comparison",
+            f"<div class='cost'>Aggregated over {lt_be.get('weeks_count', 0)} saved week(s) · {lt_be.get('total_requests', 0)} requests · ${lt_be.get('subscription_total_equivalent', 0):.2f} plan equivalent</div>"
+            + ltbe_rows
+            + f"<div class='cost'>Prices: {lt_be.get('price_source') or 'builtin'} · Tokens: {lt_be.get('token_source') or 'unknown'}. Break-even = cache hit rate at which the API would have been cheaper over the recorded period.</div>",
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1743,11 +2158,13 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
   {tok_html}
   {api_html}
   {eff_html}
+  {be_html}
   {pct_html}
   {price_html}
   {monthly_html}
   {history_html}
   {sessions_html}
+  {ltbe_html}
 
   <footer>Ollama Cloud Usage Stats · <a href="https://github.com/Kosello/ollama-cloud-watch">github.com/Kosello/ollama-cloud-watch</a></footer>
 </body>

@@ -15,6 +15,9 @@ Standalone Ollama Cloud usage monitor — a single Python file, zero dependencie
 The script fetches the authenticated [settings page](https://ollama.com/settings) first because its per-model usage-bar shares are required for Ollama $/1M estimates. `GET /api/usage` is a fallback for aggregate percentages and request counts; it cannot provide per-model Ollama prices.
 
 - **Current usage** — observed session/weekly quota %, per-model request counts and usage-bar shares, estimated Ollama $/1M, and API-equivalent $/request + $/1M
+- **API-equivalent cost** — actual $ cost of tokens consumed on Ollama, priced as if they went through the API. Per-model breakdown with a **cache-aware second line** showing the cost at your real provider cache hit rate
+- **Cache break-even** — per model, the cache hit rate at which the API becomes cheaper than the subscription, with your **real API cache rate** from other provider keys (DeepSeek, OpenRouter, etc.)
+- **Lifetime break-even** — aggregated over all saved weeks: per-model break-even and API price comparison with real cache rates
 - **Watch mode** — continuous polling with history recording and threshold alerts
 - **History** — weekly snapshots + 5h session snapshots saved locally (survives Ollama's resets)
 - **Alerts** — silent watchdog that fires OS notifications when usage crosses 75% / 90%
@@ -41,20 +44,27 @@ python ollama-cloud-watch.py
 Output (abridged):
 ```text
 📊 Ollama Cloud — Pro plan
-   Session:  0.0% used · resets in 4h
-   Weekly:   99.2% used · resets in 4h
+   Session:  2.7% used · resets in 1h
+   Weekly:   15.9% used · resets in 4 days
 
-   Weekly per model:
-     glm-5.2                   1428 req · 87.7% usage bar
-     deepseek-v4-flash:0731     929 req · 8.3% usage bar
-     deepseek-v4-pro            104 req · 3.6% usage bar
+   💰 Session: $1.0921 API
+      deepseek-v4-flash:0731  $1.0921  (with cache 98%: $0.2423)
+   💰 Weekly:  $21.4867 API
+      glm-5.2                 $0.4576  (with cache 62%: $0.2278)
+      deepseek-v4-flash:0731  $20.3505  (with cache 98%: $4.5154)
+      deepseek-v4-pro         $0.4774  (with cache 96%: $0.0966)
+      minimax-m3              $0.2012  (with cache 94%: $0.0831)
 
-   Plan vs API — per-model effective $/1M token comparison
-     Source: settings-page usage bars
+   Cache break-even — when the API becomes cheaper than the subscription
+      glm-5.2                   >100% (plan always cheaper) · real API: 62%
+      deepseek-v4-flash:0731    >100% (plan always cheaper) · real API: 98%
+      deepseek-v4-pro           API cheaper above 84% cache hit · real API: 95%
 
-     glm-5.2                   Ollama $0.0205 · API $0.0975 · 21% of API
-     deepseek-v4-flash:0731    Ollama $0.0026 · API $0.0904 · 3% of API
-     deepseek-v4-pro           Ollama $0.0118 · API $0.2545 · 5% of API
+   Lifetime break-even & price comparison
+      Aggregated over 2 saved week(s) · 2606 requests · $9.20 plan equivalent
+      glm-5.2                    1429 req · API $0.7561/1M · >100% (plan always cheaper) · real API: 62%
+      deepseek-v4-flash:0731     1024 req · API $0.0804/1M · >100% (plan always cheaper) · real API: 98%
+      deepseek-v4-pro             113 req · API $0.2569/1M · API cheaper above 98% cache hit · real API: 95%
 ```
 
 The Ollama estimate uses the real weekly usage-bar share plus historical tokens/request. API input/cache/output prices are resolved per model. `Ollama/API` is the Ollama estimate as a percentage of the real API estimate; lower means better subscription value.
@@ -135,10 +145,11 @@ Endpoints:
 
 | Endpoint | Returns |
 |---|---|
-| `/api/usage` | Current usage (session/weekly %, resets, per-model, cost estimates) |
+| `/api/usage` | Current usage (session/weekly %, resets, per-model, cost estimates, break-even) |
 | `/api/history` | Weekly history snapshots (all recorded weeks) |
 | `/api/sessions` | 5h session snapshots |
 | `/api/lifetime` | Lifetime aggregated stats (all weeks, per-model avg cost) |
+| `/api/lifetime-break-even` | Lifetime cache break-even + plan/API comparison across all saved weeks |
 | `/health` | `{"ok": true}` |
 
 ```bash
@@ -202,24 +213,41 @@ All files are kept in your home directory, independent of any other tool:
 The cookie-backed settings page exposes each model's share of Ollama's weekly usage bar. The tool combines that share with the fixed plan price, request count, and estimated tokens/request:
 
 ```text
-allocated plan value = 7-day plan equivalent × normalized model usage-bar share
+allocated plan value = 7-day plan equivalent × observed weekly quota fraction × normalized model usage-bar share
 Ollama $/1M          = allocated plan value / estimated model tokens × 1,000,000
 ```
 
-This is an effective plan-price estimate, not an Ollama token tariff. The full fixed 7-day plan equivalent is allocated across models by Ollama's observed usage-bar shares, normalized so rounded bars reconcile exactly to the plan fee; it is never scaled down by quota percentage. Token volume is estimated because Ollama exposes no current-window token/cache counts. If a bar is rounded to `0.0%`, or only `/api/usage` is available, the model's Ollama $/1M and Ollama/API percentage are shown as unavailable rather than guessed.
+This is an effective plan-price estimate, not an Ollama token tariff. The fixed 7-day plan equivalent is scaled by the observed weekly quota fraction, then allocated across models by Ollama's observed usage-bar shares, normalized so rounded bars reconcile exactly. Token volume is estimated because Ollama exposes no current-window token/cache counts. If a bar is rounded to `0.0%`, or only `/api/usage` is available, the model's Ollama $/1M and Ollama/API percentage are shown as unavailable rather than guessed.
 
-### API-equivalent estimate
-
-The API-equivalent estimate combines observed request counts with estimated
-tokens/request and public OpenRouter token prices:
+### API-equivalent cost + cache-aware line
 
 ```text
 API_$/req = uncached_input × input_$/token
           + cached_input   × cache_$/token
           + output         × output_$/token
-effective_API_$/1M = API_$/req
-                    / (uncached_input + cached_input + output) × 1,000,000
 ```
+
+Per model, a **cache-aware second line** shows the cost when prompt tokens are split by your **real provider cache hit rate** (from other API keys in Hermes `state.db` — DeepSeek native, OpenRouter, etc.):
+
+```text
+API_$/req (cached) = prompt × (1 − cache_rate) × input_$/token
+                   + prompt × cache_rate       × cache_$/token
+                   + output                   × output_$/token
+```
+
+When the same model was used via several providers, the rate from the provider with the most recorded calls wins (largest sample). OpenRouter is the fallback — native provider keys take priority.
+
+### Cache break-even
+
+```text
+break-even cache % = cache hit rate at which API cost = subscription allocation per request
+```
+
+`>100%` means even perfect caching can't make the API cheaper. The section shows your **real API cache rate** from other providers so you can see whether you're above or below the threshold.
+
+### Lifetime break-even
+
+Aggregates all saved weekly history: per-model request counts, usage-bar shares, and plan allocations across all recorded weeks. Same break-even math with today's resolved prices and token profiles. Shows which models were consistently plan-wins versus borderline over the full recorded period.
 
 Prices and token averages use automatic sources with per-model manual overrides:
 
