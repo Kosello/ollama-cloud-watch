@@ -55,6 +55,12 @@ OPTIONS
   --port PORT     HTTP server port (default 8642 for --serve, 8643 for --api)
   --cookie PATH   Custom cookie file path
   --json          Output raw JSON instead of formatted text
+
+UPDATE
+  The dashboard checks the GitHub repo for newer commits and shows an
+  update button in the footer when one is available. Clicking it runs
+  git pull --ff-only and restarts the server (requires a clean checkout
+  at the repo root).
 """
 from __future__ import annotations
 
@@ -65,6 +71,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -92,6 +99,67 @@ KEYCHAIN_SERVICE = "ollama-cloud-watch"
 KEYCHAIN_ACCOUNT = "ollama"
 HISTORY_MAX_WEEKS = 52  # keep a full year
 SESSION_LOG_CAP = 1000
+
+# ── Self-update (dashboard update button) ─────────────────────────────────
+REPO_DIR = Path(__file__).resolve().parent
+GITHUB_REPO = "Kosello/ollama-cloud-watch"
+UPDATE_CHECK_TTL = 3600  # re-check GitHub at most once per hour
+_update_state: dict = {"ts": 0.0, "result": None}
+
+
+def _git(cmd: list[str], timeout: int = 15) -> str:
+    """Run git in the repo dir; raise on failure."""
+    out = subprocess.run(
+        ["git", "-C", str(REPO_DIR), *cmd],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip() or out.stdout.strip() or f"git {' '.join(cmd)} failed")
+    return out.stdout.strip()
+
+
+def _check_for_update(force: bool = False) -> dict:
+    """Compare local HEAD with origin/main. Cached for UPDATE_CHECK_TTL."""
+    now = time.time()
+    if not force and _update_state["result"] and (now - _update_state["ts"]) < UPDATE_CHECK_TTL:
+        return _update_state["result"]
+    result = {"ok": True, "update_available": False, "local": None, "remote": None, "error": None}
+    try:
+        local = _git(["rev-parse", "HEAD"])
+        _git(["fetch", "origin", "main", "--quiet"], timeout=60)
+        remote = _git(["rev-parse", "origin/main"])
+        result["local"] = local[:7]
+        result["remote"] = remote[:7]
+        result["update_available"] = local != remote
+    except Exception as e:
+        result["ok"] = False
+        result["error"] = str(e)
+    _update_state["ts"] = now
+    _update_state["result"] = result
+    return result
+
+
+def _apply_update() -> dict:
+    """git pull --ff-only, then restart the server process.
+
+    The LaunchAgent has KeepAlive=true, so exiting is enough to come back
+    with the new code. The restart is deferred ~1s so the HTTP response
+    can be delivered first.
+    """
+    result = {"ok": True, "updated": False, "error": None}
+    try:
+        status = _git(["status", "--porcelain"])
+        if status.strip():
+            result["ok"] = False
+            result["error"] = "Local changes present — update requires a clean checkout"
+            return result
+        _git(["pull", "--ff-only", "origin", "main"], timeout=120)
+        result["updated"] = True
+        threading.Timer(1.0, lambda: os._exit(0)).start()
+    except Exception as e:
+        result["ok"] = False
+        result["error"] = str(e)
+    return result
 
 # ── Price / token fallback chain (mirrors the Hermes plugin) ──────────────
 # Priority: manual override file → live OpenRouter (24h cache) → builtin.
@@ -2291,6 +2359,9 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
   .cost {{ color: var(--quaternary); font-size: 0.75rem; margin-top: 6px; }}
   h3 {{ font-size: 0.8rem; color: var(--secondary); margin: 10px 0 4px; }}
   footer {{ color: var(--quaternary); font-size: 0.7rem; text-align: center; margin-top: 20px; }}
+  .update-btn {{ display: inline-block; margin-left: 8px; padding: 3px 10px; border: 1px solid var(--accent); border-radius: 6px; background: transparent; color: var(--accent); font-size: 0.7rem; cursor: pointer; }}
+  .update-btn:hover {{ background: var(--accent); color: #0a0a0a; }}
+  .update-btn:disabled {{ opacity: 0.6; cursor: default; }}
 </style>
 </head>
 <body>
@@ -2331,7 +2402,41 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
   {sessions_html}
   {ltbe_html}
 
-  <footer>Ollama Cloud Usage Stats · <a href="https://github.com/Kosello/ollama-cloud-watch">github.com/Kosello/ollama-cloud-watch</a></footer>
+  <footer>
+    Ollama Cloud Usage Stats · <a href="https://github.com/Kosello/ollama-cloud-watch">github.com/Kosello/ollama-cloud-watch</a>
+    <span id="update-slot"></span>
+  </footer>
+  <script>
+  // Update check — progressive enhancement; the dashboard works without it.
+  (function () {{
+    var slot = document.getElementById('update-slot');
+    if (!slot) return;
+    fetch('/api/version').then(function (r) {{ return r.json() }}).then(function (v) {{
+      if (!v.ok) {{ slot.textContent = ' · update check failed'; return }}
+      if (!v.update_available) return;
+      var btn = document.createElement('button');
+      btn.textContent = '⬆ Update available (' + v.local + ' → ' + v.remote + ')';
+      btn.className = 'update-btn';
+      btn.onclick = function () {{
+        btn.disabled = true;
+        btn.textContent = 'Updating…';
+        fetch('/api/update', {{ method: 'POST' }}).then(function (r) {{ return r.json() }}).then(function (res) {{
+          if (res.ok && res.updated) {{
+            btn.textContent = 'Updated — reloading…';
+            setTimeout(function () {{ location.reload() }}, 1500);
+          }} else {{
+            btn.disabled = false;
+            btn.textContent = 'Update failed: ' + (res.error || 'unknown error');
+          }}
+        }}).catch(function (e) {{
+          btn.disabled = false;
+          btn.textContent = 'Update failed: ' + e;
+        }});
+      }};
+      slot.appendChild(btn);
+    }}).catch(function () {{}});
+  }})();
+  </script>
 </body>
 </html>"""
 
@@ -2371,7 +2476,7 @@ class _APIHandler:
 
     def handle(self, method: str, path: str) -> tuple[int, str, str]:
         """Return (status_code, content_type, body)."""
-        if method != "GET":
+        if method != "GET" and not (method == "POST" and path == "/api/update"):
             return 405, "text/plain", "Method not allowed"
 
         if self.mode == "serve" and path == "/":
@@ -2397,6 +2502,12 @@ class _APIHandler:
             weeks = d.get("history", [])
             lt = _lifetime_from_history(weeks)
             return 200, "application/json", json.dumps(lt, indent=2, default=str)
+        if path == "/api/version":
+            return 200, "application/json", json.dumps(_check_for_update(), indent=2)
+        if path == "/api/update":
+            if method != "POST":
+                return 405, "text/plain", "Method not allowed"
+            return 200, "application/json", json.dumps(_apply_update(), indent=2)
         if path == "/health":
             return 200, "application/json", json.dumps({"ok": True})
 
@@ -2414,6 +2525,14 @@ def _run_server(cookie_path: Path, mode: str, port: int, host: str = "127.0.0.1"
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            status, ctype, body = handler_ctx.handle(self.command, self.path)
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(body.encode("utf-8"))
+
+        def do_POST(self):
             status, ctype, body = handler_ctx.handle(self.command, self.path)
             self.send_response(status)
             self.send_header("Content-Type", ctype)
