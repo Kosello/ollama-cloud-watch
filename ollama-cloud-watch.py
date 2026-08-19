@@ -2327,10 +2327,29 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
   :root {{
     --bg: #0a0a0a; --card: #161616; --border: #2a2a2a;
     --text: #e5e5e5; --secondary: #a1a1aa; --quaternary: #52525b;
-    --accent: #3b82f6; --green: #22c55e; --yellow: #f59e0b; --red: #ef4444;
+    --accent: #3b82f6; --accent-contrast: #0a0a0a;
+    --green: #22c55e; --yellow: #f59e0b; --red: #ef4444;
+  }}
+  [data-theme="light"] {{
+    --bg: #fafafa; --card: #ffffff; --border: #e4e4e7;
+    --text: #18181b; --secondary: #52525b; --quaternary: #a1a1aa;
+    --accent: #2563eb; --accent-contrast: #ffffff;
+    --green: #16a34a; --yellow: #d97706; --red: #dc2626;
+  }}
+  @media (prefers-color-scheme: light) {{
+    :root:not([data-theme="dark"]) {{
+      --bg: #fafafa; --card: #ffffff; --border: #e4e4e7;
+      --text: #18181b; --secondary: #52525b; --quaternary: #a1a1aa;
+      --accent: #2563eb; --accent-contrast: #ffffff;
+      --green: #16a34a; --yellow: #d97706; --red: #dc2626;
+    }}
   }}
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{ background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif; padding: 20px; max-width: 800px; margin: 0 auto; }}
+  .topbar {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }}
+  .topbar-right {{ display: flex; align-items: center; gap: 8px; }}
+  .theme-btn {{ border: 1px solid var(--border); background: var(--card); color: var(--secondary); border-radius: 6px; padding: 3px 8px; cursor: pointer; font-size: 0.8rem; }}
+  .theme-btn:hover {{ color: var(--text); border-color: var(--accent); }}
   h1 {{ font-size: 1.4rem; margin-bottom: 4px; }}
   .sub {{ color: var(--quaternary); font-size: 0.8rem; margin-bottom: 20px; }}
   .cards {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }}
@@ -2360,13 +2379,21 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
   h3 {{ font-size: 0.8rem; color: var(--secondary); margin: 10px 0 4px; }}
   footer {{ color: var(--quaternary); font-size: 0.7rem; text-align: center; margin-top: 20px; }}
   .update-btn {{ display: inline-block; margin-left: 8px; padding: 3px 10px; border: 1px solid var(--accent); border-radius: 6px; background: transparent; color: var(--accent); font-size: 0.7rem; cursor: pointer; }}
-  .update-btn:hover {{ background: var(--accent); color: #0a0a0a; }}
+  .update-btn:hover {{ background: var(--accent); color: var(--accent-contrast); }}
   .update-btn:disabled {{ opacity: 0.6; cursor: default; }}
 </style>
 </head>
 <body>
-  <h1>📊 Ollama Cloud Usage Stats</h1>
-  <div class="sub">{plan} plan · generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>
+  <div class="topbar">
+    <div>
+      <h1>📊 Ollama Cloud Usage Stats</h1>
+      <div class="sub">{plan} plan · generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>
+    </div>
+    <div class="topbar-right">
+      <span id="update-slot"></span>
+      <button id="theme-btn" class="theme-btn" type="button" title="Toggle dark/light theme">🌓</button>
+    </div>
+  </div>
 
   <div class="cards">
     <div class="card">
@@ -2404,9 +2431,24 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
 
   <footer>
     Ollama Cloud Usage Stats · <a href="https://github.com/Kosello/ollama-cloud-watch">github.com/Kosello/ollama-cloud-watch</a>
-    <span id="update-slot"></span>
   </footer>
   <script>
+  // Theme toggle — persisted in localStorage, defaults to system preference.
+  (function () {{
+    var btn = document.getElementById('theme-btn');
+    if (!btn) return;
+    var saved = null;
+    try {{ saved = localStorage.getItem('ocw-theme') }} catch (e) {{}}
+    var theme = saved || (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    document.documentElement.setAttribute('data-theme', theme);
+    btn.textContent = theme === 'dark' ? '☀️' : '🌙';
+    btn.onclick = function () {{
+      var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      btn.textContent = next === 'dark' ? '☀️' : '🌙';
+      try {{ localStorage.setItem('ocw-theme', next) }} catch (e) {{}}
+    }};
+  }})();
   // Update check — progressive enhancement; the dashboard works without it.
   (function () {{
     var slot = document.getElementById('update-slot');
