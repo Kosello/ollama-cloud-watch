@@ -392,10 +392,57 @@ _BUILTIN_PRICES = {
 }
 
 
+# ── Official DeepSeek-V4 API pricing (effective 2026-08-16 16:00 UTC) ──────
+# Peak hours: 01:00–04:00 and 06:00–10:00 UTC; all other hours are off-peak.
+# USD per 1M tokens: input (cache hit), input (cache miss), output.
+_DEEPSEEK_OFFICIAL_PEAK = {
+    "deepseek-v4-flash": (0.014, 0.44, 1.32),
+    "deepseek-v4-pro": (0.044, 1.32, 3.96),
+}
+_DEEPSEEK_OFFICIAL_OFFPEAK = {
+    "deepseek-v4-flash": (0.007, 0.22, 0.66),
+    "deepseek-v4-pro": (0.022, 0.66, 1.98),
+}
+# Peak windows: (start_hour, end_hour) inclusive-exclusive, UTC.
+_DEEPSEEK_PEAK_WINDOWS = ((1, 4), (6, 10))
+_DEEPSEEK_PRICING_EFFECTIVE_TS = 1786896000  # 2026-08-16 16:00 UTC
+
+
+def _is_deepseek_peak_now() -> bool:
+    """True if the current UTC time falls in a DeepSeek peak window."""
+    hour = datetime.now(timezone.utc).hour
+    return any(start <= hour < end for start, end in _DEEPSEEK_PEAK_WINDOWS)
+
+
+def _deepseek_official_price(model: str) -> tuple | None:
+    """Official DeepSeek-V4 (cache-hit, cache-miss, output) rate per 1M tokens.
+
+    Applies the new official pricing when the current UTC time is past the
+    effective timestamp (2026-08-16 16:00 UTC) and the model is one of the
+    two DeepSeek-V4 models. Returns a 3-tuple matching the plugin convention
+    ``(input, output, cached_input)`` where input is the cache-miss rate.
+    """
+    base = model.split(":", 1)[0]
+    if base not in _DEEPSEEK_OFFICIAL_PEAK:
+        return None
+    if time.time() < _DEEPSEEK_PRICING_EFFECTIVE_TS:
+        return None
+    rates = _DEEPSEEK_OFFICIAL_PEAK if _is_deepseek_peak_now() else _DEEPSEEK_OFFICIAL_OFFPEAK
+    cache_hit, cache_miss, output = rates[base]
+    return (cache_miss, output, cache_hit)
+
+
 def _lookup_price(api_prices: dict, model: str) -> tuple | None:
     """Resolve Ollama names without stripping meaningful variants too early."""
     if model in api_prices:
         return api_prices[model]
+
+    # Official DeepSeek-V4 rates beat stale OpenRouter snapshots, but never
+    # manual overrides (those are already merged into api_prices above).
+    official = _deepseek_official_price(model)
+    if official:
+        return official
+
     aliases = {
         "nemotron-3-ultra": "nvidia/nemotron-3-ultra-550b-a55b",
         "nemotron-3-super": "nvidia/nemotron-3-super-120b-a12b",
@@ -820,6 +867,25 @@ def _enrich_with_costs(data: dict) -> None:
                 seg["api_real_cache_pct"] = _cache_rate_for(
                     seg["model"], _real_provider_cache_hits()
                 )
+                # Cache-aware API effective $/1M: prompt tokens split by the
+                # real provider cache rate, priced at input/cache rates.
+                seg["api_effective_per_1m_cached"] = None
+                seg["plan_pct_of_api_cached"] = None
+                real_cache = seg["api_real_cache_pct"]
+                if real_cache is not None and prompt_t > 0:
+                    uncached_t = prompt_t * (1.0 - real_cache / 100.0)
+                    cached_t = prompt_t * (real_cache / 100.0)
+                    per_req_cached = (
+                        (uncached_t / 1e6) * p_in
+                        + (cached_t / 1e6) * p_cache
+                        + (out_t / 1e6) * p_out
+                    )
+                    api_eff_cached = per_req_cached * 1e6 / tokens_per_req
+                    seg["api_effective_per_1m_cached"] = round(api_eff_cached, 6)
+                    if seg.get("plan_effective_per_1m") is not None and api_eff_cached > 0:
+                        seg["plan_pct_of_api_cached"] = round(
+                            seg["plan_effective_per_1m"] / api_eff_cached * 100, 1
+                        )
     data["plan_rate_allocation_basis"] = (
         "7-day plan equivalent × observed weekly quota fraction × normalized usage-bar share, "
         "divided by estimated model tokens"
@@ -1029,8 +1095,18 @@ def _real_provider_cache_hits() -> dict:
                             cache = float(cache or 0)
                             if inp + cache > 0:
                                 rate = round(cache / (inp + cache) * 100.0, 1)
-                                if model not in best or calls > best[model][0]:
-                                    best[model] = (calls, rate)
+                                # Merge Ollama build-variant suffixes
+                                # (e.g. 'deepseek-v4-flash:0731') into the base
+                                # model name so the largest sample wins across
+                                # variants — a 1-call row with 0 cache must not
+                                # beat 361 calls with 97.8% cache.
+                                key = model
+                                if ":" in model:
+                                    base, _, variant = model.partition(":")
+                                    if variant and variant.isdigit():
+                                        key = base
+                                if key not in best or calls > best[key][0]:
+                                    best[key] = (calls, rate)
                         return {m: r for m, (_c, r) in best.items()}
                 except sqlite3.Error:
                     if table == "sessions":
@@ -1390,6 +1466,21 @@ def print_usage(data: dict, as_json: bool = False) -> None:
                         rc = m.get("api_real_cache_pct")
                         line += f"  (with cache {rc:.0f}%: ${wcc:.4f})" if rc is not None else f"  (with cache: ${wcc:.4f})"
                     print(line)
+        lt_be = _lifetime_break_even(_load_history(HISTORY_FILE))
+        if lt_be.get("api_lifetime_total") is not None:
+            line = f"   💰 Lifetime: ${lt_be['api_lifetime_total']:.4f} API"
+            if lt_be.get("api_lifetime_total_cached") is not None:
+                line += f"  (with cache: ${lt_be['api_lifetime_total_cached']:.4f})"
+            print(line)
+            for m in lt_be.get("models") or []:
+                lc = m.get("api_lifetime_cost")
+                if lc is not None:
+                    line = f"      {m['model']:<23} ${lc:.4f}"
+                    lcc = m.get("api_lifetime_cost_cached")
+                    if lcc is not None:
+                        rc = m.get("api_real_cache_pct")
+                        line += f"  (with cache {rc:.0f}%: ${lcc:.4f})" if rc is not None else f"  (with cache: ${lcc:.4f})"
+                    print(line)
     print()
 
     sm = data.get("session_models") or []
@@ -1441,6 +1532,20 @@ def print_usage(data: dict, as_json: bool = False) -> None:
                 print(f"       API rates:  in {in_p}  ·  cache {cache_p}{cache_note}  ·  out {out_p} /1M")
         print(f"     Ollama $/1M uses fixed 7-day plan price, observed quota fraction, normalized usage-bar share, and estimated tokens.")
         print(f"     * = cache discount not published; input rate shown.")
+
+    # ── Plan vs API with cache: same comparison, API priced at real cache rate ──
+    cached = [m for m in wm if m.get("api_effective_per_1m_cached") is not None]
+    if cached:
+        print()
+        print("   Plan vs API with cache — API side priced at your real provider cache rate")
+        print()
+        for m in cached:
+            plan_rate = f"${m['plan_effective_per_1m']:.4f}" if m.get("plan_effective_per_1m") is not None else "n/a"
+            pct = f"{m['plan_pct_of_api_cached']:.0f}%" if m.get("plan_pct_of_api_cached") is not None else "n/a"
+            real_rate = m.get("api_real_cache_pct")
+            rate_txt = f"{real_rate:.0f}%" if real_rate is not None else "?"
+            print(f"     {m['model']:<25} Ollama {plan_rate}  ·  API ({rate_txt} cache) ${m['api_effective_per_1m_cached']:.4f}  ·  {pct} of API")
+        print(f"     Same as Plan vs API, but the API $/1M uses prompt tokens split by your real provider cache rate (largest sample wins, OpenRouter fallback).")
 
     # ── Cache break-even: at what cache hit rate does the API get cheaper? ──
     be_models = [m for m in wm if m.get("api_break_even_cache_pct") is not None]
@@ -1673,6 +1778,22 @@ def _lifetime_break_even(weeks: list) -> dict:
             entry["api_cache_per_1m"] = round(p_cache, 6)
             entry["api_output_per_1m"] = round(p_out, 6)
             entry["api_cache_price_published"] = p_cache_published is not None
+            entry["api_lifetime_cost"] = round(per_req * agg["requests"], 4)
+
+            # Cache-aware lifetime cost using the real provider cache rate.
+            real_cache = _cache_rate_for(model, _real_provider_cache_hits())
+            entry["api_real_cache_pct"] = real_cache
+            if real_cache is not None and prompt_t > 0:
+                uncached_t = prompt_t * (1.0 - real_cache / 100.0)
+                cached_t = prompt_t * (real_cache / 100.0)
+                per_req_cached = (
+                    (uncached_t / 1e6) * p_in
+                    + (cached_t / 1e6) * p_cache
+                    + (out_t / 1e6) * p_out
+                )
+                entry["api_lifetime_cost_cached"] = round(per_req_cached * agg["requests"], 4)
+            else:
+                entry["api_lifetime_cost_cached"] = None
 
             # Per-model subscription allocation: the model's own share of the
             # weekly plan fee across the recorded weeks, per request. This is
@@ -1686,17 +1807,18 @@ def _lifetime_break_even(weeks: list) -> dict:
                     denom = prompt_t * (p_cache - p_in)
                     h = (sub_per_req * 1e6 - prompt_t * p_in - out_t * p_out) / denom
                     entry["api_break_even_cache_pct"] = round(max(h, 0.0) * 100.0, 1)
-                # Real provider cache rate (state.db, non-Ollama providers).
-                entry["api_real_cache_pct"] = _cache_rate_for(
-                    model, _real_provider_cache_hits()
-                )
         models.append(entry)
 
+    priced = [m for m in models if m.get("api_lifetime_cost") is not None]
     return {
         "ok": True,
         "weeks_count": len(weeks),
         "total_requests": total_reqs,
         "subscription_total_equivalent": round(total_plan_equivalent, 4),
+        "api_lifetime_total": round(sum(m["api_lifetime_cost"] for m in priced), 4) if priced else None,
+        "api_lifetime_total_cached": round(
+            sum(m["api_lifetime_cost_cached"] for m in priced if m.get("api_lifetime_cost_cached") is not None), 4
+        ) if any(m.get("api_lifetime_cost_cached") is not None for m in priced) else None,
         "price_source": price_source,
         "token_source": token_source,
         "models": models,
@@ -1907,6 +2029,20 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
                             rc = m.get("api_real_cache_pct")
                             line = line[:-7] + f" · with cache {rc:.0f}%: ${wcc:.4f}</span>" if rc is not None else line[:-7] + f" · with cache: ${wcc:.4f}</span>"
                         parts.append(line)
+            if lt_be.get("api_lifetime_total") is not None:
+                lt_line = f"Lifetime: <b>${lt_be['api_lifetime_total']:.4f}</b>"
+                if lt_be.get("api_lifetime_total_cached") is not None:
+                    lt_line += f" <span class='dim'>(with cache: ${lt_be['api_lifetime_total_cached']:.4f})</span>"
+                parts.append(lt_line)
+                for m in lt_be.get("models") or []:
+                    lc = m.get("api_lifetime_cost")
+                    if lc is not None:
+                        line = f"<span class='dim'>  {m['model']} — ${lc:.4f}</span>"
+                        lcc = m.get("api_lifetime_cost_cached")
+                        if lcc is not None:
+                            rc = m.get("api_real_cache_pct")
+                            line = line[:-7] + f" · with cache {rc:.0f}%: ${lcc:.4f}</span>" if rc is not None else line[:-7] + f" · with cache: ${lcc:.4f}</span>"
+                        parts.append(line)
             totals_html = "<div class='savings'>" + "<br>".join(parts) + "</div>"
 
         api_html = collapsible(
@@ -1957,6 +2093,33 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
             rate_table,
             open_=True,
         )
+
+        # ── Plan vs API with cache: same comparison, API priced at real cache rate ──
+        cached_html = ""
+        cached = [m for m in (data.get("weekly_models") or [])
+                  if m.get("api_effective_per_1m_cached") is not None]
+        if cached:
+            cached_cards = ""
+            for m in cached:
+                ollama_p = f"${m['plan_effective_per_1m']:.4f}" if m.get("plan_effective_per_1m") is not None else "n/a"
+                ratio = f"{m['plan_pct_of_api_cached']:.0f}%" if m.get("plan_pct_of_api_cached") is not None else "n/a"
+                real_rate = m.get("api_real_cache_pct")
+                rate_txt = f"{real_rate:.0f}%" if real_rate is not None else "?"
+                cached_cards += (
+                    f"<tr><td><b>{m['model']}</b></td>"
+                    f"<td class='num'>{ollama_p}</td>"
+                    f"<td class='num'>${m['api_effective_per_1m_cached']:.4f} ({rate_txt} cache)</td>"
+                    f"<td class='num'>{ratio}</td></tr>"
+                )
+            cached_html = collapsible(
+                "Plan vs API with cache",
+                "<div class='cost'>Same as Plan vs API, but the API $/1M uses prompt tokens split by your real provider cache rate (largest sample wins, OpenRouter fallback).</div>"
+                + (
+                    "<table><thead><tr><th>Model</th><th class='num'>Ollama $/1M</th><th class='num'>API $/1M (cache)</th><th class='num'>Ollama/API</th></tr></thead>"
+                    f"<tbody>{cached_cards}</tbody></table>"
+                ),
+                open_=False,
+            )
 
         # ── Cache break-even compact HTML ──
         be_html = ""
@@ -2024,6 +2187,7 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
             )
     else:
         eff_html = ""
+        cached_html = ""
         be_html = ""
         pct_html = ""
         price_html = ""
@@ -2158,6 +2322,7 @@ def _generate_html(data: dict, history: list, sessions: list) -> str:
   {tok_html}
   {api_html}
   {eff_html}
+  {cached_html}
   {be_html}
   {pct_html}
   {price_html}
